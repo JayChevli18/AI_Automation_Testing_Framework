@@ -1,0 +1,2 @@
+"""Artifact service placeholder."""
+
