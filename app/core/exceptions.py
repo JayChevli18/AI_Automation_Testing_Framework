@@ -1,0 +1,2 @@
+"""Custom exceptions placeholder."""
+
