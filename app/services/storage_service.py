@@ -96,11 +96,25 @@ class StorageService:
             raise NotFoundError(f"Run directory not found for run_id={run_id}")
         return run_dir
 
+    def get_run_input_file(self, run_id: str) -> Path:
+        """Return copied run input Excel path."""
+        input_file = self.get_run_dir(run_id) / "input.xlsx"
+        if not input_file.exists():
+            raise NotFoundError(f"Run input.xlsx not found for run_id={run_id}")
+        return input_file
+
     def write_json(self, run_id: str, name: str, payload: dict | list) -> Path:
         run_dir = self.get_run_dir(run_id)
         path = run_dir / name
         path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
         return path
+
+    def read_json(self, run_id: str, name: str) -> dict | list:
+        """Read a JSON artifact from the run directory."""
+        path = self.get_run_dir(run_id) / name
+        if not path.exists():
+            raise NotFoundError(f"{name} not found for run_id={run_id}")
+        return json.loads(path.read_text(encoding="utf-8"))
 
     def write_text(self, run_id: str, name: str, payload: str) -> Path:
         run_dir = self.get_run_dir(run_id)
