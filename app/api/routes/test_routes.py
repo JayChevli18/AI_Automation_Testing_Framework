@@ -53,11 +53,17 @@ async def upload_test_file(file: UploadFile = File(...)) -> UploadResponse:
 
 @router.post("/run", response_model=RunResponse)
 def start_run(request: RunRequest) -> RunResponse:
-    """Create a run record and queue run lifecycle."""
+    """Create run record and generate normalized testcase artifacts."""
     try:
         run_meta = run_manager.create_run(request)
+        run_manager.generate_normalized_testcases(run_meta.run_id)
     except NotFoundError as exc:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc)) from exc
+    except Exception as exc:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to parse/normalize uploaded Excel: {exc}",
+        ) from exc
 
     return RunResponse(success=True, run_id=run_meta.run_id, status=run_meta.status)
 
@@ -67,6 +73,7 @@ def get_run_results(run_id: str) -> RunResultResponse:
     """Return current run metadata and basic counters."""
     try:
         run_meta = run_manager.get_run(run_id)
+        counts = run_manager.get_run_counts(run_id, run_meta.status)
     except NotFoundError as exc:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc)) from exc
 
@@ -74,6 +81,6 @@ def get_run_results(run_id: str) -> RunResultResponse:
         success=True,
         run_id=run_meta.run_id,
         status=run_meta.status,
-        counts=RunCounts(),
+        counts=counts,
     )
 
