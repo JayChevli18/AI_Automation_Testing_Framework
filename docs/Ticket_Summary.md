@@ -1,4 +1,4 @@
-# Ticket Summary: AI-Driven Excel Test Execution POC (with Local LLM via Ollama)
+# Task Summary: AI-Driven Excel Test Execution POC (with Local LLM via Ollama)
 
 ## Objective
 
@@ -7,7 +7,7 @@ Build a proof of concept (POC) where test cases written in Excel are interpreted
 ---
 
 ## End-to-End Flow
-
+  
 1. **Excel test cases input**
 2. **LLM interprets each step into executable actions**
 3. **Automation engine performs browser actions**

@@ -6,6 +6,11 @@ import os
 from dataclasses import dataclass
 from pathlib import Path
 
+from dotenv import load_dotenv
+
+# Load variables from project .env for local development.
+load_dotenv()
+
 
 @dataclass(frozen=True)
 class Settings:
@@ -20,6 +25,10 @@ class Settings:
     default_environment: str = os.getenv("DEFAULT_ENVIRONMENT", "beta")
     default_headless: bool = os.getenv("HEADLESS", "true").lower() == "true"
     step_timeout_ms: int = int(os.getenv("STEP_TIMEOUT_MS", "30000"))
+    ollama_url: str = os.getenv("OLLAMA_URL", "http://localhost:11434")
+    ollama_model: str = os.getenv("OLLAMA_MODEL", "llama3.1:8b")
+    ollama_timeout_s: int = int(os.getenv("OLLAMA_TIMEOUT_S", "120"))
+    ollama_json_format: bool = os.getenv("OLLAMA_JSON_FORMAT", "true").lower() == "true"
 
     @property
     def uploads_dir(self) -> Path:

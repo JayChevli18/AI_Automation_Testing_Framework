@@ -4,4 +4,6 @@ python-multipart
 pydantic
 pandas
 openpyxl
+requests
+python-dotenv
 

@@ -53,18 +53,25 @@ async def upload_test_file(file: UploadFile = File(...)) -> UploadResponse:
 
 @router.post("/run", response_model=RunResponse)
 def start_run(request: RunRequest) -> RunResponse:
-    """Create run record and generate normalized testcase artifacts."""
+    """Create run record, normalize Excel, then interpret steps via Ollama."""
     try:
         run_meta = run_manager.create_run(request)
         run_manager.generate_normalized_testcases(run_meta.run_id)
+        run_manager.generate_interpreted_steps(run_meta.run_id)
     except NotFoundError as exc:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc)) from exc
+    except ConnectionError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail=f"Ollama is unavailable: {exc}",
+        ) from exc
     except Exception as exc:
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Failed to parse/normalize uploaded Excel: {exc}",
+            detail=f"Failed to process run: {exc}",
         ) from exc
 
+    run_meta = run_manager.get_run(run_meta.run_id)
     return RunResponse(success=True, run_id=run_meta.run_id, status=run_meta.status)
 
 
