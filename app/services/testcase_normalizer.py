@@ -84,5 +84,6 @@ class TestcaseNormalizer:
 
     @staticmethod
     def _clean(value: str) -> str:
-        return re.sub(r"\s+", " ", value).strip()
+        cleaned = value.replace("_x000d_", " ").replace("\\n", " ")
+        return re.sub(r"\s+", " ", cleaned).strip()
 
