@@ -5,6 +5,7 @@ from __future__ import annotations
 from fastapi import APIRouter, File, HTTPException, UploadFile, status
 
 from app.core.exceptions import NotFoundError
+from app.core.logger import get_logger
 from app.models.request_models import RunRequest
 from app.models.response_models import (
     RunCounts,
@@ -16,6 +17,7 @@ from app.services.run_manager import RunManager
 from app.services.storage_service import StorageService
 
 router = APIRouter(prefix="/tests", tags=["tests"])
+logger = get_logger(__name__)
 
 storage_service = StorageService()
 run_manager = RunManager(storage_service=storage_service)
@@ -53,11 +55,19 @@ async def upload_test_file(file: UploadFile = File(...)) -> UploadResponse:
 
 @router.post("/run", response_model=RunResponse)
 def start_run(request: RunRequest) -> RunResponse:
-    """Create run record, normalize Excel, then interpret steps via Ollama."""
+    """Create run record and execute full v1 flow up to Playwright execution."""
     try:
+        logger.info(
+            "api=/run status=start file_id=%s environment=%s headless=%s continue_on_failure=%s",
+            request.file_id,
+            request.environment,
+            request.headless,
+            request.continue_on_failure,
+        )
         run_meta = run_manager.create_run(request)
         run_manager.generate_normalized_testcases(run_meta.run_id)
         run_manager.generate_interpreted_steps(run_meta.run_id)
+        run_manager.execute_interpreted_cases(run_meta.run_id)
     except NotFoundError as exc:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc)) from exc
     except ConnectionError as exc:
@@ -72,6 +82,11 @@ def start_run(request: RunRequest) -> RunResponse:
         ) from exc
 
     run_meta = run_manager.get_run(run_meta.run_id)
+    logger.info(
+        "api=/run status=done run_id=%s final_status=%s",
+        run_meta.run_id,
+        run_meta.status,
+    )
     return RunResponse(success=True, run_id=run_meta.run_id, status=run_meta.status)
 
 

@@ -29,6 +29,12 @@ class Settings:
     ollama_model: str = os.getenv("OLLAMA_MODEL", "llama3.1:8b")
     ollama_timeout_s: int = int(os.getenv("OLLAMA_TIMEOUT_S", "120"))
     ollama_json_format: bool = os.getenv("OLLAMA_JSON_FORMAT", "true").lower() == "true"
+    beta_base_url: str = os.getenv("BETA_BASE_URL", "http://localhost:3000")
+    live_base_url: str = os.getenv("LIVE_BASE_URL", "http://localhost:3000")
+    default_timeout_ms: int = int(os.getenv("DEFAULT_TIMEOUT", "30000"))
+    screenshot_on_failure: bool = (
+        os.getenv("SCREENSHOT_ON_FAILURE", "true").lower() == "true"
+    )
 
     @property
     def uploads_dir(self) -> Path:
