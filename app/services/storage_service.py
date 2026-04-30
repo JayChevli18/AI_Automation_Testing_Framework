@@ -122,6 +122,14 @@ class StorageService:
         path.write_text(payload, encoding="utf-8")
         return path
 
+    def append_text(self, run_id: str, name: str, payload: str) -> Path:
+        """Append plain text to a run artifact file."""
+        run_dir = self.get_run_dir(run_id)
+        path = run_dir / name
+        with path.open("a", encoding="utf-8") as handle:
+            handle.write(payload)
+        return path
+
     def _write_upload_meta(self, meta: UploadedFileMeta) -> None:
         meta_path = self.uploads_dir / f"{meta.file_id}.json"
         meta_path.write_text(
