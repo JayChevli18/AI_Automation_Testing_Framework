@@ -8,6 +8,7 @@ from pydantic import BaseModel, Field
 
 InterpretedAction = Literal[
     "goto",
+    "hover",
     "click",
     "fill",
     "assert_visible",

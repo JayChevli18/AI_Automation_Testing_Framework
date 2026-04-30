@@ -24,6 +24,7 @@ from app.services.step_interpreter import StepInterpreter
 from app.services.storage_service import StorageService
 from app.services.test_runner import TestRunner
 from app.services.testcase_normalizer import TestcaseNormalizer
+from app.services.report_service import ReportService
 
 
 class RunManager:
@@ -36,6 +37,7 @@ class RunManager:
         testcase_normalizer: TestcaseNormalizer | None = None,
         step_interpreter: StepInterpreter | None = None,
         test_runner: TestRunner | None = None,
+        report_service: ReportService | None = None,
     ) -> None:
         self.logger = get_logger(__name__)
         self.storage_service = storage_service
@@ -45,6 +47,7 @@ class RunManager:
         )
         self.step_interpreter = step_interpreter or StepInterpreter()
         self.test_runner = test_runner or TestRunner()
+        self.report_service = report_service or ReportService()
 
     def _log(self, run_id: str, message: str) -> None:
         timestamp = datetime.now(timezone.utc).isoformat()
@@ -213,6 +216,12 @@ class RunManager:
             name="execution_summary.json",
             payload=summary.model_dump(mode="json"),
         )
+        allure_dir = self.report_service.write_allure_results(run_dir=run_dir, summary=summary)
+        html_report = self.report_service.write_html_report(run_dir=run_dir, summary=summary)
+        self._log(
+            run_id,
+            f"phase=report status=done allure_results_dir={allure_dir} html_report={html_report}",
+        )
         self.storage_service.update_run_status(
             run_id, RUN_STATUS_COMPLETED if summary.failed_cases == 0 else RUN_STATUS_FAILED
         )
@@ -221,4 +230,24 @@ class RunManager:
             f"phase=execute status=done total_cases={summary.total_cases} passed={summary.passed_cases} failed={summary.failed_cases}",
         )
         return summary
+
+    def get_execution_summary(self, run_id: str) -> dict:
+        """Return persisted full execution summary JSON."""
+        raw = self.storage_service.read_json(run_id, "execution_summary.json")
+        if not isinstance(raw, dict):
+            raise ValueError("execution_summary.json must be an object")
+        return raw
+
+    def get_report_index(self, run_id: str) -> dict:
+        """Return report artifact locations for a run."""
+        run_dir = self.storage_service.get_run_dir(run_id)
+        allure_dir = run_dir / "allure-results"
+        if not allure_dir.exists():
+            raise FileNotFoundError("allure-results not found for this run")
+        result_files = sorted(p.name for p in allure_dir.glob("*-result.json"))
+        return {
+            "allure_results_dir": str(allure_dir),
+            "allure_result_files": result_files,
+            "html_report_path": str(run_dir / "report.html"),
+        }
 

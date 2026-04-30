@@ -63,6 +63,9 @@ class ActionExecutor:
                 url = self._resolve_url(target)
                 await page.goto(url, timeout=timeout)
                 locator_strategy = "navigation"
+            elif action == "hover":
+                locator, locator_strategy = await self.locator_engine.resolve(page, action, target)
+                await locator.first.hover(timeout=timeout)
             elif action == "click":
                 locator, locator_strategy = await self.locator_engine.resolve(page, action, target)
                 await locator.first.click(timeout=timeout)

@@ -41,3 +41,21 @@ class RunResultResponse(BaseModel):
     status: str
     counts: RunCounts
 
+
+class RunExecutionSummaryResponse(BaseModel):
+    """Full execution summary response."""
+
+    success: bool
+    run_id: str
+    summary: dict
+
+
+class RunReportResponse(BaseModel):
+    """Report artifact discovery response."""
+
+    success: bool
+    run_id: str
+    allure_results_dir: str
+    allure_result_files: list[str]
+    html_report_path: str
+

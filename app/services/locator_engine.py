@@ -37,7 +37,7 @@ class LocatorEngine:
             raise ValueError("Empty target for locator resolution.")
 
         # click/assert paths: role and text heuristics
-        if action in {"click", "assert_visible", "assert_text"}:
+        if action in {"hover", "click", "assert_visible", "assert_text"}:
             lower = normalized.lower()
             name = _accessible_name_from_target(normalized)
             words = lower.split()

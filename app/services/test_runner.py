@@ -37,19 +37,9 @@ class TestRunner:
 
         screenshots_dir = run_dir / "screenshots"
         html_dir = run_dir / "html"
+        step_timeout = run_meta.step_timeout_ms or settings.default_timeout_ms
 
         async with async_playwright() as p:
-            browser = await p.chromium.launch(headless=run_meta.headless)
-            if run_logger:
-                run_logger(
-                    run_meta.run_id,
-                    f"phase=execute browser=chromium mode={'headless' if run_meta.headless else 'headed'} launched=true",
-                )
-            context = await browser.new_context()
-            page = await context.new_page()
-            step_timeout = run_meta.step_timeout_ms or settings.default_timeout_ms
-            page.set_default_timeout(step_timeout)
-
             for test_case_id, case in case_map.items():
                 if run_logger:
                     run_logger(
@@ -75,6 +65,16 @@ class TestRunner:
                         )
                     continue
 
+                browser = await p.chromium.launch(headless=run_meta.headless)
+                context = await browser.new_context()
+                page = await context.new_page()
+                page.set_default_timeout(step_timeout)
+                if run_logger:
+                    run_logger(
+                        run_meta.run_id,
+                        f"phase=execute testcase={test_case_id} browser=chromium mode={'headless' if run_meta.headless else 'headed'} launched=true",
+                    )
+
                 step_results = []
                 case_status = "passed"
                 for step in interpreted.steps:
@@ -99,6 +99,9 @@ class TestRunner:
                         if not run_meta.continue_on_failure:
                             break
 
+                await context.close()
+                await browser.close()
+
                 results.append(
                     CaseExecutionResult(
                         test_case_id=test_case_id,
@@ -117,9 +120,6 @@ class TestRunner:
                         run_meta.run_id,
                         f"phase=execute testcase={test_case_id} status={case_status}",
                     )
-
-            await context.close()
-            await browser.close()
 
         return RunExecutionSummary(
             run_id=run_meta.run_id,
