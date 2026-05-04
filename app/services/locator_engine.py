@@ -2,11 +2,43 @@
 
 from __future__ import annotations
 
+import re
 from typing import Any
 
 from playwright.async_api import Locator, Page
 
 from app.services.selector_cache import SelectorCache
+
+_ADD_TO_CART_TEXT = re.compile(r"add\s*to\s*cart", re.IGNORECASE)
+
+_ORDINAL_PREFIX_TO_INDEX: dict[str, int] = {
+    "first": 0,
+    "1st": 0,
+    "second": 1,
+    "2nd": 1,
+    "third": 2,
+    "3rd": 2,
+    "fourth": 3,
+    "4th": 3,
+    "fifth": 4,
+    "5th": 4,
+    "sixth": 5,
+    "6th": 5,
+    "seventh": 6,
+    "7th": 6,
+    "eighth": 7,
+    "8th": 7,
+    "ninth": 8,
+    "9th": 8,
+    "tenth": 9,
+    "10th": 9,
+}
+
+
+def _leading_ordinal_index(lower: str) -> int | None:
+    first = lower.strip().lower().split(maxsplit=1)[0] if lower.strip() else ""
+    first = first.rstrip(".,;:")
+    return _ORDINAL_PREFIX_TO_INDEX.get(first)
 
 
 def _accessible_name_from_target(raw: str) -> str:
@@ -42,6 +74,10 @@ class LocatorEngine:
         if t == "role":
             loc = page.get_by_role(recipe["role"], name=recipe["name"])
             return loc, f"cached_role_{recipe['role']}"
+        if t == "add_to_cart_ordinal":
+            idx = int(recipe["index"])
+            loc = page.locator("a,button").filter(has_text=_ADD_TO_CART_TEXT).nth(idx)
+            return loc, f"add_to_cart_ordinal_{idx}"
         if t == "text":
             return page.get_by_text(recipe["text"], exact=False), "cached_text"
         if t == "label":
@@ -92,6 +128,12 @@ class LocatorEngine:
                     "role_link_signin",
                     recipe,
                 )
+            if action in {"click", "hover"} and "add to cart" in lower:
+                ord_idx = _leading_ordinal_index(lower)
+                if ord_idx is not None:
+                    recipe = {"t": "add_to_cart_ordinal", "index": ord_idx}
+                    loc = page.locator("a,button").filter(has_text=_ADD_TO_CART_TEXT).nth(ord_idx)
+                    return loc, "add_to_cart_ordinal", recipe
             if "link" in words:
                 link_name = name or lower.replace("link", "").strip()
                 recipe = {"t": "role", "role": "link", "name": link_name}
