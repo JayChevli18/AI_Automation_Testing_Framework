@@ -13,6 +13,7 @@ from app.models.interpreted_models import InterpretedCaseRecord
 from app.models.run_models import RunMeta
 from app.models.testcase_models import NormalizedTestCase
 from app.services.action_executor import ActionExecutor
+from app.services.selector_cache import SelectorCache
 
 
 class TestRunner:
@@ -77,6 +78,12 @@ class TestRunner:
 
                 step_results = []
                 case_status = "passed"
+                selector_cache = SelectorCache()
+                base_url = (
+                    settings.live_base_url
+                    if run_meta.environment == "live"
+                    else settings.beta_base_url
+                )
                 for step in interpreted.steps:
                     step_result = await self.action_executor.execute_step(
                         page=page,
@@ -87,6 +94,10 @@ class TestRunner:
                         screenshots_dir=screenshots_dir,
                         html_dir=html_dir,
                         timeout_ms=step_timeout,
+                        environment=run_meta.environment,
+                        allow_live_mutations=run_meta.allow_live_mutations,
+                        base_url=base_url,
+                        selector_cache=selector_cache,
                     )
                     step_results.append(step_result)
                     if step_result.status == "failed":

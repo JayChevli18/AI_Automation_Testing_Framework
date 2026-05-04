@@ -16,4 +16,8 @@ class RunRequest(BaseModel):
     continue_on_failure: bool = True
     step_timeout_ms: int = Field(default=30000, ge=1000)
     max_cases: int | None = Field(default=None, ge=1)
+    allow_live_mutations: bool = Field(
+        default=False,
+        description="Must be true to run click/fill/hover against environment=live.",
+    )
 

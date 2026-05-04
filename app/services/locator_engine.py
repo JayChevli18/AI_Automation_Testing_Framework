@@ -2,7 +2,11 @@
 
 from __future__ import annotations
 
+from typing import Any
+
 from playwright.async_api import Locator, Page
+
+from app.services.selector_cache import SelectorCache
 
 
 def _accessible_name_from_target(raw: str) -> str:
@@ -31,18 +35,46 @@ def _accessible_name_from_target(raw: str) -> str:
 class LocatorEngine:
     """Resolve elements using simple role/label/text heuristics."""
 
-    async def resolve(self, page: Page, action: str, target: str) -> tuple[Locator, str]:
+    @staticmethod
+    def build_from_recipe(page: Page, recipe: dict[str, Any]) -> tuple[Locator, str]:
+        """Rebuild a locator from a cached recipe."""
+        t = recipe.get("t")
+        if t == "role":
+            loc = page.get_by_role(recipe["role"], name=recipe["name"])
+            return loc, f"cached_role_{recipe['role']}"
+        if t == "text":
+            return page.get_by_text(recipe["text"], exact=False), "cached_text"
+        if t == "label":
+            return page.get_by_label(recipe["label"]), "cached_label"
+        if t == "locator":
+            return page.locator(recipe["selector"]), recipe.get("strategy", "cached_locator")
+        raise ValueError(f"Unknown locator recipe type: {t!r}")
+
+    async def resolve(
+        self,
+        page: Page,
+        action: str,
+        target: str,
+        *,
+        cache: SelectorCache | None = None,
+        cache_key: str | None = None,
+    ) -> tuple[Locator, str, dict[str, Any] | None]:
         normalized = (target or "").strip()
         if not normalized:
             raise ValueError("Empty target for locator resolution.")
 
-        # click/assert paths: role and text heuristics
+        if cache is not None and cache_key:
+            cached = cache.get(cache_key)
+            if cached:
+                loc, strat = self.build_from_recipe(page, cached)
+                return loc, strat, cached
+
+        recipe: dict[str, Any] | None = None
+
         if action in {"hover", "click", "assert_visible", "assert_text"}:
             lower = normalized.lower()
             name = _accessible_name_from_target(normalized)
             words = lower.split()
-            # Header "Sign In" is usually a link; the login form often uses a <button>SIGN IN</button>.
-            # Only treat sign-in/log-in as a link when the target clearly refers to header/nav (not the form).
             nav_hint = any(
                 w in lower
                 for w in ("header", "navigation", "nav bar", "top bar", "site menu")
@@ -53,31 +85,36 @@ class LocatorEngine:
                 or "log in" in lower
                 or name in ("sign in", "sign-in", "log in")
             ):
-                return page.get_by_role("link", name=name or "sign in"), "role_link_signin"
+                rname = name or "sign in"
+                recipe = {"t": "role", "role": "link", "name": rname}
+                return (
+                    page.get_by_role("link", name=rname),
+                    "role_link_signin",
+                    recipe,
+                )
             if "link" in words:
                 link_name = name or lower.replace("link", "").strip()
-                return page.get_by_role("link", name=link_name), "role_link"
+                recipe = {"t": "role", "role": "link", "name": link_name}
+                return page.get_by_role("link", name=link_name), "role_link", recipe
             if "button" in lower:
-                return page.get_by_role("button", name=name or lower), "role_button"
-            return page.get_by_text(normalized, exact=False), "text"
+                bname = name or lower
+                recipe = {"t": "role", "role": "button", "name": bname}
+                return page.get_by_role("button", name=bname), "role_button", recipe
+            recipe = {"t": "text", "text": normalized}
+            return page.get_by_text(normalized, exact=False), "text", recipe
 
-        # fill path: label / placeholder / basic input fallback.
         if action == "fill":
             lower = normalized.lower()
             if "email" in lower:
-                return (
-                    page.locator("input[type='email'], input[name*='email'], input[id*='email']"),
-                    "input_email",
-                )
+                sel = "input[type='email'], input[name*='email'], input[id*='email']"
+                recipe = {"t": "locator", "selector": sel, "strategy": "input_email"}
+                return page.locator(sel), "input_email", recipe
             if "password" in lower:
-                return (
-                    page.locator(
-                        "input[type='password'], input[name*='password'], input[id*='password']"
-                    ),
-                    "input_password",
-                )
-            return page.get_by_label(normalized), "label"
+                sel = "input[type='password'], input[name*='password'], input[id*='password']"
+                recipe = {"t": "locator", "selector": sel, "strategy": "input_password"}
+                return page.locator(sel), "input_password", recipe
+            recipe = {"t": "label", "label": normalized}
+            return page.get_by_label(normalized), "label", recipe
 
-        # Default fallback.
-        return page.get_by_text(normalized, exact=False), "text_fallback"
-
+        recipe = {"t": "text", "text": normalized}
+        return page.get_by_text(normalized, exact=False), "text_fallback", recipe

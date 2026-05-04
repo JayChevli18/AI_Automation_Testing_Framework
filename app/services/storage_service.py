@@ -48,6 +48,7 @@ class StorageService:
         continue_on_failure: bool,
         step_timeout_ms: int,
         max_cases: int | None,
+        allow_live_mutations: bool = False,
     ) -> RunMeta:
         upload_path = self._get_upload_path_by_file_id(file_id)
         run_id = f"run_{datetime.now(timezone.utc).strftime('%Y%m%d_%H%M%S')}_{uuid4().hex[:4]}"
@@ -70,6 +71,7 @@ class StorageService:
             continue_on_failure=continue_on_failure,
             step_timeout_ms=step_timeout_ms,
             max_cases=max_cases,
+            allow_live_mutations=allow_live_mutations,
             created_at=now,
             updated_at=now,
         )

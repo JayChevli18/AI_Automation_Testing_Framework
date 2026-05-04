@@ -13,17 +13,49 @@ from app.utils.json_utils import extract_json_object
 
 logger = logging.getLogger(__name__)
 
-_SYSTEM_RULES = """You are a test automation step interpreter. Output ONLY valid JSON, no markdown, no explanation.
-Rules:
-- Keys: action, target, value, value_key, assertion, confidence, missing_value, notes
-- action must be one of: goto, hover, click, fill, assert_visible, assert_text, wait, unknown
-- target: short lower-case description of UI element or page goal (e.g. "sign in button", "email field")
-- If the manual step says hover/mouse over/move cursor over, action must be "hover" (never convert that to goto).
-- For fill: use value_key matching test_data keys (e.g. email, password) when the step implies test data; else value literal if given in step
-- Do not invent secrets; if credentials needed but not in step text, set missing_value true and value_key if inferable
-- For verify/see/check visible UI: assert_visible or assert_text; put expected text in assertion as {"text": "..."} when needed
-- confidence: 0.0-1.0
-- notes: optional short reason"""
+_SYSTEM_RULES = """You are a test automation step interpreter. Output ONLY one JSON object. No markdown, no prose, no code fences.
+
+Required keys: action, target, value, value_key, assertion, confidence, missing_value, notes
+- action must be exactly one of: goto, hover, click, fill, assert_visible, assert_text, wait, unknown
+
+=== goto (navigation only — strict) ===
+Use "goto" ONLY when the step is clearly about loading a page by URL or path, for example:
+- "Open the website", "Go to https://...", "Navigate to /sign-in", "Open home page"
+Do NOT use "goto" if the step says click, tap, press, select, choose, hit, or open a link/button/menu item.
+Never use "goto" with target that is only a layout region name (e.g. "header", "footer", "sidebar", "navbar") — those are not URLs.
+
+=== click ===
+If the step says click/tap/press (a control) or implies activating a link or button, action MUST be "click".
+Examples that MUST be "click", never "goto":
+- "In the header, click the Sign In link" -> action click, target "sign in link" (or similar short phrase for the link)
+- "Click the Login button" -> action click, target "login button"
+
+=== hover ===
+If the manual step says hover / mouse over / move cursor over, action must be "hover" (never "goto").
+
+=== fill ===
+When the step is entering data that comes from the test_data keys listed in the user message:
+- Set value_key to exactly one of those keys (e.g. email, password).
+- Set value to null (JSON null). Never set value to the words "email", "password", or any key name — those are not the real credential values.
+- Do not put secrets in value; the runner loads the actual string from test_data using value_key.
+If the step gives a literal to type (e.g. a code shown in the step text) and it is NOT in test_data, use value for that literal and value_key null.
+Do not invent secrets; if needed but not in step text, set missing_value true and value_key if inferable.
+
+=== assert_text vs assert_visible ===
+- If the step quotes specific text to check (e.g. "Assert text X is visible", "Verify message Y", "Popup shows Z"), use action "assert_text" and set assertion to {"text": "..."} with the EXACT expected substring from the step (strip only surrounding quotes). target can repeat that text or be a short label like "expected message".
+- Use "assert_visible" only when checking visibility of a named UI element without a fixed literal string (e.g. "dashboard panel is visible").
+
+=== wait ===
+Use "wait" only for explicit waits/sleeps; value can be milliseconds as a string if given.
+
+=== target ===
+Keep target as a short, lower-case phrase describing the element or navigation intent. Do not put full sentences in target.
+
+=== confidence ===
+confidence is a number from 0.0 to 1.0.
+
+=== notes ===
+notes is optional, very short reason if needed."""
 
 _USER_TEMPLATE = """test_data keys available: {keys}
 manual step: {step}
@@ -52,11 +84,12 @@ class StepInterpreter:
         if data is None:
             raise ValueError(f"Could not parse interpreter JSON from: {text[:500]!r}")
         try:
-            return self._apply_action_overrides(step, self._validate(data))
+            validated = self._validate(data)
+            return self._apply_action_overrides(step, validated, test_data)
         except ValidationError:
             repaired = self.repair_invalid_json(text)
             if repaired:
-                return self._apply_action_overrides(step, self._validate(repaired))
+                return self._apply_action_overrides(step, self._validate(repaired), test_data)
             raise
 
     def interpret_case_steps(
@@ -103,10 +136,60 @@ Input to fix: {raw_text[:4000]}"""
         return InterpretedStep.model_validate(data)
 
     @staticmethod
-    def _apply_action_overrides(raw_step: str, interpreted: InterpretedStep) -> InterpretedStep:
-        """Force deterministic action mapping for high-signal verbs."""
+    def _apply_action_overrides(
+        raw_step: str,
+        interpreted: InterpretedStep,
+        test_data: dict[str, str],
+    ) -> InterpretedStep:
+        """Force deterministic action mapping for high-signal verbs and fill fixes."""
         step = (raw_step or "").strip().lower()
         hover_tokens = ("hover", "mouse over", "move cursor over")
         if any(token in step for token in hover_tokens):
             interpreted.action = "hover"
+
+        if interpreted.action == "fill":
+            StepInterpreter._normalize_fill_step(raw_step, interpreted, test_data)
+
         return interpreted
+
+    @staticmethod
+    def _normalize_fill_step(
+        raw_step: str,
+        interpreted: InterpretedStep,
+        test_data: dict[str, str],
+    ) -> None:
+        """Align value_key with the field mentioned in the step; strip bogus value placeholders."""
+        step_l = (raw_step or "").lower()
+
+        # Prefer explicit field phrases, then fall back to keywords (email before password conflicts).
+        if (
+            "email field" in step_l
+            or "wrong email" in step_l
+            or "e-mail field" in step_l
+        ) and "email" in test_data:
+            interpreted.value_key = "email"
+        elif ("password field" in step_l or "pwd field" in step_l) and "password" in test_data:
+            interpreted.value_key = "password"
+        elif "email" in step_l and "password" not in step_l and "email" in test_data:
+            interpreted.value_key = "email"
+        elif "password" in step_l and "email" not in step_l and "password" in test_data:
+            interpreted.value_key = "password"
+
+        vk = interpreted.value_key
+        if vk and vk in test_data:
+            interpreted.value = None
+
+        bad_placeholders = {
+            "",
+            "password",
+            "email",
+            "pwd",
+            "e-mail",
+            "username",
+            "user name",
+        }
+        if vk:
+            bad_placeholders.add(vk.lower())
+        v = interpreted.value
+        if v is not None and str(v).strip().lower() in bad_placeholders:
+            interpreted.value = None
