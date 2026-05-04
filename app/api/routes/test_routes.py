@@ -59,6 +59,14 @@ async def upload_test_file(file: UploadFile = File(...)) -> UploadResponse:
 @router.post("/run", response_model=RunResponse)
 def start_run(request: RunRequest) -> RunResponse:
     """Create run record and execute full v1 flow up to Playwright execution."""
+    if request.environment == "live" and not request.allow_live_mutations:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail=(
+                "Runs against environment=live require allow_live_mutations=true "
+                "(mutating steps are blocked by default for safety)."
+            ),
+        )
     try:
         logger.info(
             "api=/run status=start file_id=%s environment=%s headless=%s continue_on_failure=%s",

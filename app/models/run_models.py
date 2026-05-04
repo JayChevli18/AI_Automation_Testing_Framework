@@ -27,6 +27,7 @@ class RunMeta(BaseModel):
     continue_on_failure: bool
     step_timeout_ms: int
     max_cases: int | None
+    allow_live_mutations: bool = False
     created_at: datetime
     updated_at: datetime
 

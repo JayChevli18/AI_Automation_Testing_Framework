@@ -35,6 +35,8 @@ class Settings:
     screenshot_on_failure: bool = (
         os.getenv("SCREENSHOT_ON_FAILURE", "true").lower() == "true"
     )
+    step_retry_max: int = int(os.getenv("STEP_RETRY_MAX", "2"))
+    step_retry_delay_ms: int = int(os.getenv("STEP_RETRY_DELAY_MS", "400"))
 
     @property
     def uploads_dir(self) -> Path:

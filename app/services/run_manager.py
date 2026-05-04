@@ -63,6 +63,7 @@ class RunManager:
             continue_on_failure=request.continue_on_failure,
             step_timeout_ms=request.step_timeout_ms,
             max_cases=request.max_cases,
+            allow_live_mutations=request.allow_live_mutations,
         )
 
     def get_run(self, run_id: str) -> RunMeta:

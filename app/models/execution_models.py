@@ -16,6 +16,7 @@ class StepExecutionResult(BaseModel):
     locator_strategy: str | None = None
     duration_ms: int = 0
     url: str | None = None
+    attempts: int = 1
     error_type: str | None = None
     error_message: str | None = None
     screenshot_path: str | None = None
