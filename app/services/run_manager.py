@@ -91,7 +91,7 @@ class RunManager:
 
     def list_runs_with_query(self, query: RunListRequest) -> tuple[list[RunMeta], int]:
         """Run listing with filter/search/sort and pagination."""
-        rows = self.storage_service.list_run_metas(limit=5000)
+        rows = self.storage_service.list_run_metas(limit=50)
         return apply_listing_query(
             rows,
             page=query.page,
@@ -630,4 +630,28 @@ class RunManager:
         else:
             deleted_ids = [r.run_id for r in candidates]
         return deleted_ids, len(all_runs)
+
+    def get_metrics(self) -> dict:
+        """Return lightweight counters for frontend dashboard metrics cards."""
+        runs = self.storage_service.list_run_metas(limit=10000)
+        now = datetime.now(timezone.utc)
+        last_24h = now - timedelta(hours=24)
+        last_7d = now - timedelta(days=7)
+
+        by_status: dict[str, int] = {}
+        for r in runs:
+            by_status[r.status] = by_status.get(r.status, 0) + 1
+
+        recent_24h = [r for r in runs if r.created_at >= last_24h]
+        recent_7d = [r for r in runs if r.created_at >= last_7d]
+
+        return {
+            "total_runs": len(runs),
+            "by_status": by_status,
+            "runs_last_24h": len(recent_24h),
+            "runs_last_7d": len(recent_7d),
+            "active_runs": by_status.get(RUN_STATUS_RUNNING, 0),
+            "queued_runs": by_status.get(RUN_STATUS_QUEUED, 0),
+            "cancelled_runs": by_status.get(RUN_STATUS_CANCELLED, 0),
+        }
 

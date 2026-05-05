@@ -200,6 +200,20 @@ Base URL example: `http://127.0.0.1:8000`. Interactive docs: `http://127.0.0.1:8
 
 ---
 
+### `GET /api/tests/metrics`
+
+- **Purpose:** Return simple dashboard counters from run metadata.
+- **Response (`RunMetricsResponse`):**
+  - `total_runs`
+  - `by_status` (counts per run status)
+  - `runs_last_24h`
+  - `runs_last_7d`
+  - `active_runs`
+  - `queued_runs`
+  - `cancelled_runs`
+
+---
+
 ### `POST /api/tests/upload`
 
 - **Purpose:** Upload one Excel file containing test cases.
@@ -498,6 +512,7 @@ Sample files may live under `docs/` (e.g. `TestCases_Login_Module_Sample.xlsx`).
 
 - **Purpose:** All REST endpoints under **`/api/tests`** (plus prefix from config).
 - **Key behaviors:**
+  - **`GET /metrics`:** Lightweight counters for dashboard cards.
   - Validates upload extension and empty files.
   - **`POST /runs/list`:** Paginated/searchable/sortable run listing.
   - **`POST /run`:** Full pipeline; blocks unsafe live runs unless `allow_live_mutations=true`.
@@ -698,6 +713,7 @@ Legend — **Called from:**
 
 | Name | HTTP | Purpose | Called from | Example |
 |------|------|---------|-------------|---------|
+| `get_metrics` | `GET /api/tests/metrics` | Returns simple dashboard counters from run metadata. | Frontend dashboard cards | — |
 | `upload_test_file` | `POST /api/tests/upload` | Validates `.xlsx`/`.xls`, saves bytes via `StorageService.save_upload`, returns `file_id`. | Postman / Swagger | Upload `Login.xlsx` → get `f_...` |
 | `start_run` | `POST /api/tests/run` | Validates live safety → `RunManager.create_run` → normalize → interpret → execute → reports; maps errors to HTTP status. | Client after upload | Body `{"file_id":"f_..."}` |
 | `start_interpret_only` | `POST /api/tests/interpret` | `RunManager.interpret_only` — LLM only. | Split pipeline | — |
@@ -722,6 +738,7 @@ Legend — **Called from:**
 | `_log(run_id, message)` | Appends timestamped line to console logger **and** `logs/run.log`. | Internal phases | `"phase=normalize status=start"` |
 | `create_run(request)` | Delegates to `storage_service.create_run` with request fields + `allow_live_mutations`. | `start_run`, `interpret_only` | After upload |
 | `get_run(run_id)` | Reads `run_meta.json`. | API results endpoints | — |
+| `get_metrics()` | Aggregates lightweight counters for dashboard cards. | `get_metrics` route | — |
 | `get_run_counts(run_id, status)` | Prefers counts from root `execution_summary.json`; else pending count from normalized list. | `get_run_results` | — |
 | `generate_normalized_testcases(run_id)` | Reads `input.xlsx`, parse → normalize → writes `normalized_testcases.json`. | `start_run`, `interpret_only` | Phase 1 |
 | `generate_interpreted_steps(run_id)` | For each step calls `step_interpreter.try_interpret_step`; writes `interpreted_steps.json`; may raise `ConnectionError` if Ollama totally fails. | `start_run`, `interpret_only` | Phase 2 |
@@ -729,6 +746,9 @@ Legend — **Called from:**
 | `interpret_only(request)` | `create_run` + normalize + interpret. | `start_interpret_only` | — |
 | `execute_interpreted_versioned(request)` | Versioned dir + `test_runner.run(..., artifact_base_dir=...)`. | `start_execute_versioned` | — |
 | `patch_interpreted_steps(run_id, request)` | Merge PATCH into `interpreted_steps.json`. | `patch_interpreted_steps` route | — |
+| `request_cancel(run_id, reason)` | Flags run cancellation (cooperative). | `cancel_run` route | — |
+| `cleanup_runs(request)` | Retention cleanup / dry-run for old runs. | `cleanup_runs` route | — |
+| `get_artifact_index(run_id, execution_id)` | Consolidated report/screenshot/html index. | `get_artifact_index` route | — |
 | `_merge_step_record` | Applies one `StepPatchItem` using `model_fields_set`. | `patch_interpreted_steps` | — |
 | `list_versioned_executions` / `get_versioned_execution_summary` / `get_versioned_report_index` | Versioned artifact reads. | Versioned GET routes | — |
 | `get_execution_summary(run_id)` | Reads **root** `execution_summary.json` as dict. | `get_run_execution_summary` | — |
@@ -1104,6 +1124,7 @@ Open **`http://127.0.0.1:8000/docs`** to try uploads and runs.
 | **Interpret** | Convert each manual step string into a structured action via **Ollama** → **`interpreted_steps.json`**. |
 | **Execute** | Drive the browser using **Playwright** (full **`/run`** at run root, or **`execute-versioned`** under **`executions/<execution_id>/`**). |
 | **execution_id** | Folder name **`exec_<timestamp>_<suffix>`** for one versioned browser run. |
+| **Revision lock** | Optional `expected_revision` in PATCH to prevent lost updates on interpreted steps. |
 | **Headless** | Browser runs without a visible window; **`headless: false`** shows the window. |
 
 ---
