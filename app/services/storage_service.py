@@ -146,3 +146,124 @@ class StorageService:
                 return candidate
         raise NotFoundError(f"Uploaded file not found for file_id={file_id}")
 
+    def create_versioned_execution_dir(self, run_id: str) -> tuple[str, Path]:
+        """Create executions/exec_<ts>_<id>/ with screenshots, html, allure-results."""
+        run_dir = self.get_run_dir(run_id)
+        executions_root = run_dir / "executions"
+        executions_root.mkdir(exist_ok=True)
+        execution_id = (
+            f"exec_{datetime.now(timezone.utc).strftime('%Y%m%d_%H%M%S')}_{uuid4().hex[:4]}"
+        )
+        exec_dir = executions_root / execution_id
+        exec_dir.mkdir(parents=False, exist_ok=False)
+        (exec_dir / "screenshots").mkdir(exist_ok=True)
+        (exec_dir / "html").mkdir(exist_ok=True)
+        (exec_dir / "allure-results").mkdir(exist_ok=True)
+        return execution_id, exec_dir
+
+    @staticmethod
+    def _path_under_run(run_dir: Path, candidate: Path) -> Path:
+        run_resolved = run_dir.resolve()
+        path = (run_resolved / candidate).resolve()
+        try:
+            path.relative_to(run_resolved)
+        except ValueError as exc:
+            raise ValueError("Artifact path escapes run directory") from exc
+        return path
+
+    def write_json_relative(self, run_id: str, relative_path: str | Path, payload: dict | list) -> Path:
+        """Write JSON under the run directory; creates parent folders."""
+        run_dir = self.get_run_dir(run_id)
+        path = self._path_under_run(run_dir, Path(relative_path))
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+        return path
+
+    def read_json_relative(self, run_id: str, relative_path: str | Path) -> dict | list:
+        run_dir = self.get_run_dir(run_id)
+        path = self._path_under_run(run_dir, Path(relative_path))
+        if not path.exists():
+            raise NotFoundError(f"{relative_path} not found for run_id={run_id}")
+        return json.loads(path.read_text(encoding="utf-8"))
+
+    def update_run_execution_options(
+        self,
+        run_id: str,
+        *,
+        environment: str | None = None,
+        headless: bool | None = None,
+        continue_on_failure: bool | None = None,
+        step_timeout_ms: int | None = None,
+        allow_live_mutations: bool | None = None,
+    ) -> RunMeta:
+        """Patch execution-related fields on run_meta without touching status."""
+        meta = self.get_run_meta(run_id)
+        updates: dict = {"updated_at": datetime.now(timezone.utc)}
+        if environment is not None:
+            updates["environment"] = environment
+        if headless is not None:
+            updates["headless"] = headless
+        if continue_on_failure is not None:
+            updates["continue_on_failure"] = continue_on_failure
+        if step_timeout_ms is not None:
+            updates["step_timeout_ms"] = step_timeout_ms
+        if allow_live_mutations is not None:
+            updates["allow_live_mutations"] = allow_live_mutations
+        new_meta = meta.model_copy(update=updates)
+        self.write_json(run_id, "run_meta.json", new_meta.model_dump(mode="json"))
+        return new_meta
+
+    def read_execution_manifest(self, run_id: str) -> list[dict]:
+        run_dir = self.get_run_dir(run_id)
+        path = run_dir / "executions" / "manifest.json"
+        if not path.exists():
+            return []
+        raw = json.loads(path.read_text(encoding="utf-8"))
+        if not isinstance(raw, list):
+            return []
+        return [x for x in raw if isinstance(x, dict)]
+
+    def append_execution_manifest(self, run_id: str, entry: dict) -> None:
+        run_dir = self.get_run_dir(run_id)
+        manifest_path = run_dir / "executions" / "manifest.json"
+        manifest_path.parent.mkdir(parents=True, exist_ok=True)
+        existing = self.read_execution_manifest(run_id)
+        existing.append(entry)
+        manifest_path.write_text(json.dumps(existing, indent=2), encoding="utf-8")
+
+    def write_latest_execution_pointer(self, run_id: str, execution_id: str) -> None:
+        self.write_json_relative(
+            run_id,
+            Path("executions") / "latest.json",
+            {"execution_id": execution_id},
+        )
+
+    def get_latest_execution_id(self, run_id: str) -> str | None:
+        run_dir = self.get_run_dir(run_id)
+        latest_path = run_dir / "executions" / "latest.json"
+        if latest_path.exists():
+            data = json.loads(latest_path.read_text(encoding="utf-8"))
+            if isinstance(data, dict) and data.get("execution_id"):
+                return str(data["execution_id"])
+        manifest = self.read_execution_manifest(run_id)
+        if manifest and manifest[-1].get("execution_id"):
+            return str(manifest[-1]["execution_id"])
+        return None
+
+    def backup_interpreted_steps_if_exists(self, run_id: str) -> None:
+        """Copy interpreted_steps.json to interpreted_steps.backup.<utc_ts>.json if present."""
+        path = self.get_run_dir(run_id) / "interpreted_steps.json"
+        if not path.exists():
+            return
+        ts = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
+        backup = path.with_name(f"interpreted_steps.backup.{ts}.json")
+        backup.write_bytes(path.read_bytes())
+
+    def atomic_write_interpreted_steps(self, run_id: str, payload: list[dict]) -> None:
+        """Replace interpreted_steps.json via temp file + rename."""
+        run_dir = self.get_run_dir(run_id)
+        target = run_dir / "interpreted_steps.json"
+        tmp = run_dir / "interpreted_steps.json.tmp"
+        tmp.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+        tmp.replace(target)
+

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 from datetime import datetime, timezone
+from pathlib import Path
 
 from app.core.constants import (
     RUN_STATUS_COMPLETED,
@@ -12,10 +13,17 @@ from app.core.constants import (
     RUN_STATUS_QUEUED,
     RUN_STATUS_RUNNING,
 )
+from app.core.exceptions import ConflictError
 from app.core.logger import get_logger
 from app.models.execution_models import RunExecutionSummary
 from app.models.interpreted_models import InterpretedCaseRecord, InterpretedStepRecord
-from app.models.request_models import RunRequest
+from app.models.request_models import (
+    ExecuteFromInterpretedRequest,
+    InterpretRunRequest,
+    InterpretedStepsPatchRequest,
+    RunRequest,
+    StepPatchItem,
+)
 from app.models.run_models import RunMeta
 from app.models.response_models import RunCounts
 from app.models.testcase_models import NormalizedTestCase
@@ -251,4 +259,204 @@ class RunManager:
             "allure_result_files": result_files,
             "html_report_path": str(run_dir / "report.html"),
         }
+
+    def interpret_only(self, request: InterpretRunRequest) -> RunMeta:
+        """Create run folder, normalize Excel, interpret steps with LLM; no browser."""
+        run_meta = self.create_run(request)
+        self.generate_normalized_testcases(run_meta.run_id)
+        self.generate_interpreted_steps(run_meta.run_id)
+        return self.get_run(run_meta.run_id)
+
+    def execute_interpreted_versioned(
+        self, request: ExecuteFromInterpretedRequest
+    ) -> tuple[str, RunExecutionSummary]:
+        """Run Playwright using existing interpreted JSON; artifacts under executions/<id>/."""
+        run_id = request.interpret_run_id
+        run_dir = self.storage_service.get_run_dir(run_id)
+        if not (run_dir / "interpreted_steps.json").exists():
+            raise ValueError(
+                "interpreted_steps.json not found; call POST /interpret (or full /run) first."
+            )
+        if not (run_dir / "normalized_testcases.json").exists():
+            raise ValueError("normalized_testcases.json not found for this run_id.")
+
+        self.storage_service.update_run_execution_options(
+            run_id,
+            environment=request.environment,
+            headless=request.headless,
+            continue_on_failure=request.continue_on_failure,
+            step_timeout_ms=request.step_timeout_ms,
+            allow_live_mutations=request.allow_live_mutations,
+        )
+
+        execution_id, execution_dir = self.storage_service.create_versioned_execution_dir(run_id)
+        started_at = datetime.now(timezone.utc)
+        self.storage_service.update_run_status(run_id, RUN_STATUS_RUNNING)
+        run_meta = self.storage_service.get_run_meta(run_id)
+        self._log(
+            run_id,
+            f"phase=execute_versioned execution_id={execution_id} status=start "
+            f"environment={run_meta.environment} headless={run_meta.headless}",
+        )
+
+        normalized_raw = self.storage_service.read_json(run_id, "normalized_testcases.json")
+        interpreted_raw = self.storage_service.read_json(run_id, "interpreted_steps.json")
+        if not isinstance(normalized_raw, list) or not isinstance(interpreted_raw, list):
+            self.storage_service.update_run_status(run_id, RUN_STATUS_FAILED)
+            raise ValueError("normalized/interpreted artifacts must be list JSON structures.")
+
+        normalized_cases = [NormalizedTestCase.model_validate(i) for i in normalized_raw]
+        interpreted_cases = [InterpretedCaseRecord.model_validate(i) for i in interpreted_raw]
+
+        try:
+            summary = asyncio.run(
+                self.test_runner.run(
+                    run_meta=run_meta,
+                    cases=normalized_cases,
+                    interpreted_cases=interpreted_cases,
+                    run_dir=run_dir,
+                    run_logger=self._log,
+                    artifact_base_dir=execution_dir,
+                )
+            )
+        except Exception as exc:
+            self.storage_service.update_run_status(run_id, RUN_STATUS_FAILED)
+            finished_bad = datetime.now(timezone.utc)
+            self.storage_service.append_execution_manifest(
+                run_id,
+                {
+                    "execution_id": execution_id,
+                    "started_at": started_at.isoformat(),
+                    "finished_at": finished_bad.isoformat(),
+                    "status": "failed",
+                    "error_message": str(exc),
+                },
+            )
+            self._log(
+                run_id,
+                f"phase=execute_versioned execution_id={execution_id} status=error error={exc}",
+            )
+            raise
+
+        rel_summary = Path("executions") / execution_id / "execution_summary.json"
+        self.storage_service.write_json_relative(
+            run_id,
+            rel_summary,
+            summary.model_dump(mode="json"),
+        )
+        allure_dir = self.report_service.write_allure_results(run_dir=execution_dir, summary=summary)
+        html_report = self.report_service.write_html_report(run_dir=execution_dir, summary=summary)
+        finished_at = datetime.now(timezone.utc)
+
+        self.storage_service.append_execution_manifest(
+            run_id,
+            {
+                "execution_id": execution_id,
+                "started_at": started_at.isoformat(),
+                "finished_at": finished_at.isoformat(),
+                "status": summary.status,
+                "total_cases": summary.total_cases,
+                "passed_cases": summary.passed_cases,
+                "failed_cases": summary.failed_cases,
+            },
+        )
+        self.storage_service.write_latest_execution_pointer(run_id, execution_id)
+
+        final_status = RUN_STATUS_COMPLETED if summary.failed_cases == 0 else RUN_STATUS_FAILED
+        self.storage_service.update_run_status(run_id, final_status)
+        self._log(
+            run_id,
+            f"phase=execute_versioned execution_id={execution_id} status=done "
+            f"allure_results_dir={allure_dir} html_report={html_report} "
+            f"passed={summary.passed_cases} failed={summary.failed_cases}",
+        )
+        return execution_id, summary
+
+    def list_versioned_executions(self, run_id: str) -> list[dict]:
+        """Return manifest entries for versioned browser executions."""
+        return self.storage_service.read_execution_manifest(run_id)
+
+    def get_versioned_execution_summary(self, run_id: str, execution_id: str) -> dict:
+        rel = Path("executions") / execution_id / "execution_summary.json"
+        raw = self.storage_service.read_json_relative(run_id, rel)
+        if not isinstance(raw, dict):
+            raise ValueError("execution_summary must be an object")
+        return raw
+
+    def get_versioned_report_index(self, run_id: str, execution_id: str) -> dict:
+        run_dir = self.storage_service.get_run_dir(run_id)
+        execution_dir = run_dir / "executions" / execution_id
+        allure_dir = execution_dir / "allure-results"
+        if not allure_dir.exists():
+            raise FileNotFoundError(f"allure-results not found for execution_id={execution_id}")
+        result_files = sorted(p.name for p in allure_dir.glob("*-result.json"))
+        return {
+            "allure_results_dir": str(allure_dir),
+            "allure_result_files": result_files,
+            "html_report_path": str(execution_dir / "report.html"),
+        }
+
+    @staticmethod
+    def _merge_step_record(record: InterpretedStepRecord, patch: StepPatchItem) -> InterpretedStepRecord:
+        data = record.model_dump(mode="json")
+        if "raw_step" in patch.model_fields_set:
+            data["raw_step"] = patch.raw_step
+        if "interpreted" in patch.model_fields_set:
+            if patch.interpreted is None:
+                data["interpreted"] = None
+            else:
+                data["interpreted"] = patch.interpreted.model_dump(mode="json")
+        if "interpretation_error" in patch.model_fields_set:
+            data["interpretation_error"] = patch.interpretation_error
+        return InterpretedStepRecord.model_validate(data)
+
+    def patch_interpreted_steps(self, run_id: str, request: InterpretedStepsPatchRequest) -> list[str]:
+        """Merge PATCH payload into interpreted_steps.json (validated, atomic write)."""
+        meta = self.get_run(run_id)
+        if meta.status == RUN_STATUS_RUNNING:
+            raise ConflictError(
+                "Run status is 'running'; wait until execution finishes before editing interpreted steps."
+            )
+
+        raw = self.storage_service.read_json(run_id, "interpreted_steps.json")
+        if not isinstance(raw, list):
+            raise ValueError("interpreted_steps.json must be a JSON array")
+
+        cases = [InterpretedCaseRecord.model_validate(x) for x in raw]
+        by_id = {c.test_case_id: i for i, c in enumerate(cases)}
+        patched_ids: list[str] = []
+
+        for patch in request.patches:
+            if patch.test_case_id not in by_id:
+                raise ValueError(f"Unknown test_case_id: {patch.test_case_id!r}")
+            idx = by_id[patch.test_case_id]
+            case = cases[idx]
+
+            if patch.steps is not None:
+                cases[idx] = InterpretedCaseRecord(
+                    test_case_id=case.test_case_id,
+                    test_case_name=case.test_case_name,
+                    module=case.module,
+                    steps=patch.steps,
+                )
+            else:
+                new_steps = list(case.steps)
+                for sp in patch.step_patches or []:
+                    matches = [i for i, s in enumerate(new_steps) if s.step_index == sp.step_index]
+                    if not matches:
+                        raise ValueError(
+                            f"No step with step_index={sp.step_index} for {patch.test_case_id!r}"
+                        )
+                    pos = matches[0]
+                    new_steps[pos] = self._merge_step_record(new_steps[pos], sp)
+                cases[idx] = case.model_copy(update={"steps": new_steps})
+
+            patched_ids.append(patch.test_case_id)
+
+        payload = [c.model_dump(mode="json") for c in cases]
+
+        self.storage_service.backup_interpreted_steps_if_exists(run_id)
+        self.storage_service.atomic_write_interpreted_steps(run_id, payload)
+        self._log(run_id, f"interpreted_steps.json patched test_cases={patched_ids}")
+        return patched_ids
 

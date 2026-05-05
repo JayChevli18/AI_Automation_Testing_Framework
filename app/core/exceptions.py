@@ -12,3 +12,7 @@ class StorageError(AppError):
 class NotFoundError(AppError):
     """Raised when required resources are missing."""
 
+
+class ConflictError(AppError):
+    """Raised when the request conflicts with current resource state (e.g. run in progress)."""
+
