@@ -9,14 +9,27 @@ from pydantic import ValidationError
 from app.core.exceptions import ConflictError, NotFoundError
 from app.core.logger import get_logger
 from app.models.request_models import (
+    CancelRunRequest,
+    CleanupRunsRequest,
     ExecuteFromInterpretedRequest,
     InterpretRunRequest,
     InterpretedStepsPatchRequest,
+    RunListRequest,
     RunRequest,
 )
 from app.models.response_models import (
+    ArtifactIndexResponse,
+    CancelRunResponse,
+    CleanupRunsResponse,
+    InterpretedStepsReadResponse,
     InterpretedStepsPatchResponse,
+    LatestExecutionResponse,
     RunExecutionSummaryResponse,
+    RunListData,
+    RunListItem,
+    RunListMeta,
+    RunListPostResponse,
+    RunListResponse,
     RunReportResponse,
     RunResponse,
     RunResultResponse,
@@ -33,6 +46,45 @@ logger = get_logger(__name__)
 
 storage_service = StorageService()
 run_manager = RunManager(storage_service=storage_service)
+
+
+@router.post("/runs/list", response_model=RunListPostResponse)
+def list_runs(body: RunListRequest) -> RunListPostResponse:
+    """Paginated run listing with search/sort/filter (POST contract)."""
+    try:
+        runs, total_items = run_manager.list_runs_with_query(body)
+    except Exception as exc:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to list runs: {exc}",
+        ) from exc
+
+    total_pages = (total_items + body.limit - 1) // body.limit if total_items > 0 else 0
+    return RunListPostResponse(
+        success=True,
+        message="Run listing retrieved successfully",
+        data=RunListData(
+            list=[
+                RunListItem(
+                    run_id=r.run_id,
+                    file_id=r.file_id,
+                    status=r.status,
+                    environment=r.environment,
+                    created_at=r.created_at.isoformat(),
+                    updated_at=r.updated_at.isoformat(),
+                )
+                for r in runs
+            ],
+            meta=RunListMeta(
+                currentPage=body.page,
+                totalPages=total_pages,
+                totalItems=total_items,
+                itemsPerPage=body.limit,
+                hasNextPage=body.page < total_pages,
+                hasPreviousPage=body.page > 1 and total_pages > 0,
+            )
+        ),
+    )
 
 
 @router.post("/upload", response_model=UploadResponse)
@@ -138,6 +190,27 @@ def start_interpret_only(request: InterpretRunRequest) -> RunResponse:
     return RunResponse(success=True, run_id=run_meta.run_id, status=run_meta.status)
 
 
+@router.get(
+    "/runs/{run_id}/interpreted-steps",
+    response_model=InterpretedStepsReadResponse,
+)
+def get_interpreted_steps(run_id: str) -> InterpretedStepsReadResponse:
+    """Return current interpreted_steps.json for editor/read-only UI."""
+    try:
+        interpreted_steps, revision = run_manager.get_interpreted_steps(run_id)
+    except NotFoundError as exc:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=str(exc)) from exc
+
+    return InterpretedStepsReadResponse(
+        success=True,
+        run_id=run_id,
+        interpreted_steps=interpreted_steps,
+        revision=revision,
+    )
+
+
 @router.patch("/runs/{run_id}/interpreted-steps", response_model=InterpretedStepsPatchResponse)
 def patch_interpreted_steps(run_id: str, body: InterpretedStepsPatchRequest) -> InterpretedStepsPatchResponse:
     """Merge manual edits into ``interpreted_steps.json`` without re-running the LLM.
@@ -147,7 +220,7 @@ def patch_interpreted_steps(run_id: str, body: InterpretedStepsPatchRequest) -> 
     with JSON ``null`` to clear them.
     """
     try:
-        patched = run_manager.patch_interpreted_steps(run_id, body)
+        patched, revision = run_manager.patch_interpreted_steps(run_id, body)
     except NotFoundError as exc:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc)) from exc
     except ConflictError as exc:
@@ -170,7 +243,60 @@ def patch_interpreted_steps(run_id: str, body: InterpretedStepsPatchRequest) -> 
         success=True,
         run_id=run_id,
         patched_test_case_ids=patched,
+        revision=revision,
         message="interpreted_steps.json updated",
+    )
+
+
+@router.get("/runs/{run_id}/artifacts", response_model=ArtifactIndexResponse)
+def get_artifact_index(run_id: str, execution_id: str | None = None) -> ArtifactIndexResponse:
+    """Return consolidated artifact index for run or selected execution_id."""
+    try:
+        artifacts = run_manager.get_artifact_index(run_id, execution_id)
+    except NotFoundError as exc:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc)) from exc
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc)) from exc
+
+    return ArtifactIndexResponse(
+        success=True,
+        run_id=run_id,
+        execution_id=artifacts.get("execution_id"),
+        artifacts=artifacts,
+    )
+
+
+@router.post("/runs/{run_id}/cancel", response_model=CancelRunResponse)
+def cancel_run(run_id: str, body: CancelRunRequest) -> CancelRunResponse:
+    """Request cooperative cancellation for a run."""
+    try:
+        meta = run_manager.request_cancel(run_id, reason=body.reason)
+    except NotFoundError as exc:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc)) from exc
+
+    return CancelRunResponse(
+        success=True,
+        run_id=run_id,
+        status=meta.status,
+        message="Cancellation requested",
+    )
+
+
+@router.post("/runs/cleanup", response_model=CleanupRunsResponse)
+def cleanup_runs(body: CleanupRunsRequest) -> CleanupRunsResponse:
+    """Retention cleanup for old run folders."""
+    try:
+        deleted_ids, scanned = run_manager.cleanup_runs(body)
+    except Exception as exc:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Cleanup failed: {exc}",
+        ) from exc
+    return CleanupRunsResponse(
+        success=True,
+        message="Dry-run completed" if body.dry_run else "Cleanup completed",
+        deleted_run_ids=deleted_ids,
+        scanned=scanned,
     )
 
 
@@ -212,6 +338,23 @@ def start_execute_versioned(request: ExecuteFromInterpretedRequest) -> Versioned
         run_id=run_meta.run_id,
         execution_id=execution_id,
         status=run_meta.status,
+    )
+
+
+@router.get("/runs/{run_id}/executions/latest", response_model=LatestExecutionResponse)
+def get_latest_execution(run_id: str) -> LatestExecutionResponse:
+    """Return latest versioned execution pointer + manifest entry."""
+    try:
+        _ = run_manager.get_run(run_id)  # ensure run exists
+        execution_id, execution = run_manager.get_latest_execution_info(run_id)
+    except NotFoundError as exc:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc)) from exc
+
+    return LatestExecutionResponse(
+        success=True,
+        run_id=run_id,
+        execution_id=execution_id,
+        execution=execution,
     )
 
 
@@ -312,10 +455,13 @@ def get_run_results(run_id: str) -> RunResultResponse:
 
 
 @router.get("/results/{run_id}/summary", response_model=RunExecutionSummaryResponse)
-def get_run_execution_summary(run_id: str) -> RunExecutionSummaryResponse:
+def get_run_execution_summary(
+    run_id: str,
+    execution_id: str | None = None,
+) -> RunExecutionSummaryResponse:
     """Return full per-step execution summary JSON."""
     try:
-        summary = run_manager.get_execution_summary(run_id)
+        summary = run_manager.get_execution_summary(run_id, execution_id)
     except NotFoundError as exc:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc)) from exc
     except ValueError as exc:
@@ -325,10 +471,13 @@ def get_run_execution_summary(run_id: str) -> RunExecutionSummaryResponse:
 
 
 @router.get("/reports/{run_id}", response_model=RunReportResponse)
-def get_run_report_artifacts(run_id: str) -> RunReportResponse:
+def get_run_report_artifacts(
+    run_id: str,
+    execution_id: str | None = None,
+) -> RunReportResponse:
     """Return report artifacts index for a completed run."""
     try:
-        report_index = run_manager.get_report_index(run_id)
+        report_index = run_manager.get_report_index(run_id, execution_id)
     except NotFoundError as exc:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc)) from exc
     except FileNotFoundError as exc:
@@ -344,10 +493,13 @@ def get_run_report_artifacts(run_id: str) -> RunReportResponse:
 
 
 @router.get("/reports/{run_id}/html")
-def get_run_report_html(run_id: str) -> FileResponse:
+def get_run_report_html(
+    run_id: str,
+    execution_id: str | None = None,
+) -> FileResponse:
     """Serve generated run HTML dashboard report."""
     try:
-        report_index = run_manager.get_report_index(run_id)
+        report_index = run_manager.get_report_index(run_id, execution_id)
         html_report_path = report_index["html_report_path"]
     except NotFoundError as exc:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc)) from exc

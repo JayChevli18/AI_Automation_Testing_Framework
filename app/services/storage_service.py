@@ -3,12 +3,13 @@
 from __future__ import annotations
 
 import json
+import shutil
 from datetime import datetime, timezone
 from pathlib import Path
 from uuid import uuid4
 
 from app.config import settings
-from app.core.constants import RUN_STATUS_QUEUED
+from app.core.constants import RUN_STATUS_QUEUED, RUN_STATUS_RUNNING
 from app.core.exceptions import NotFoundError
 from app.models.run_models import RunMeta, UploadedFileMeta
 
@@ -72,6 +73,7 @@ class StorageService:
             step_timeout_ms=step_timeout_ms,
             max_cases=max_cases,
             allow_live_mutations=allow_live_mutations,
+            cancel_requested=False,
             created_at=now,
             updated_at=now,
         )
@@ -81,6 +83,8 @@ class StorageService:
     def update_run_status(self, run_id: str, status: str) -> RunMeta:
         run_meta = self.get_run_meta(run_id)
         run_meta.status = status
+        if status == RUN_STATUS_RUNNING:
+            run_meta.cancel_requested = False
         run_meta.updated_at = datetime.now(timezone.utc)
         self.write_json(run_id, "run_meta.json", run_meta.model_dump(mode="json"))
         return run_meta
@@ -213,6 +217,18 @@ class StorageService:
         self.write_json(run_id, "run_meta.json", new_meta.model_dump(mode="json"))
         return new_meta
 
+    def request_cancel_run(self, run_id: str) -> RunMeta:
+        """Mark a run for cooperative cancellation."""
+        meta = self.get_run_meta(run_id)
+        meta.cancel_requested = True
+        meta.updated_at = datetime.now(timezone.utc)
+        self.write_json(run_id, "run_meta.json", meta.model_dump(mode="json"))
+        return meta
+
+    def is_cancel_requested(self, run_id: str) -> bool:
+        """Return True when a cancellation request is pending for run_id."""
+        return bool(self.get_run_meta(run_id).cancel_requested)
+
     def read_execution_manifest(self, run_id: str) -> list[dict]:
         run_dir = self.get_run_dir(run_id)
         path = run_dir / "executions" / "manifest.json"
@@ -250,6 +266,38 @@ class StorageService:
             return str(manifest[-1]["execution_id"])
         return None
 
+    def list_run_metas(self, limit: int = 50) -> list[RunMeta]:
+        """Return run metadata rows sorted by created_at descending."""
+        rows: list[RunMeta] = []
+        for run_dir in sorted(self.runs_dir.glob("run_*"), reverse=True):
+            run_meta_path = run_dir / "run_meta.json"
+            if not run_meta_path.exists():
+                continue
+            try:
+                data = json.loads(run_meta_path.read_text(encoding="utf-8"))
+                rows.append(RunMeta.model_validate(data))
+            except Exception:
+                continue
+            if len(rows) >= limit:
+                break
+        return rows
+
+    def delete_run_dir(self, run_id: str) -> None:
+        """Delete run directory recursively."""
+        run_dir = self.get_run_dir(run_id)
+        shutil.rmtree(run_dir)
+
+    def get_latest_execution_entry(self, run_id: str) -> dict | None:
+        """Return manifest entry for latest execution_id if present."""
+        execution_id = self.get_latest_execution_id(run_id)
+        if not execution_id:
+            return None
+        manifest = self.read_execution_manifest(run_id)
+        for item in reversed(manifest):
+            if item.get("execution_id") == execution_id:
+                return item
+        return {"execution_id": execution_id}
+
     def backup_interpreted_steps_if_exists(self, run_id: str) -> None:
         """Copy interpreted_steps.json to interpreted_steps.backup.<utc_ts>.json if present."""
         path = self.get_run_dir(run_id) / "interpreted_steps.json"
@@ -266,4 +314,33 @@ class StorageService:
         tmp = run_dir / "interpreted_steps.json.tmp"
         tmp.write_text(json.dumps(payload, indent=2), encoding="utf-8")
         tmp.replace(target)
+
+    def get_interpreted_revision(self, run_id: str) -> int:
+        """Return interpreted steps revision (defaults to 1 when file exists)."""
+        run_dir = self.get_run_dir(run_id)
+        meta_path = run_dir / "interpreted_steps.meta.json"
+        if meta_path.exists():
+            try:
+                data = json.loads(meta_path.read_text(encoding="utf-8"))
+                rev = int(data.get("revision", 1))
+                return max(1, rev)
+            except Exception:
+                return 1
+        interpreted_path = run_dir / "interpreted_steps.json"
+        return 1 if interpreted_path.exists() else 0
+
+    def set_interpreted_revision(self, run_id: str, revision: int) -> None:
+        """Persist interpreted revision metadata."""
+        run_dir = self.get_run_dir(run_id)
+        meta_path = run_dir / "interpreted_steps.meta.json"
+        meta_path.write_text(
+            json.dumps(
+                {
+                    "revision": max(1, int(revision)),
+                    "updated_at": datetime.now(timezone.utc).isoformat(),
+                },
+                indent=2,
+            ),
+            encoding="utf-8",
+        )
 

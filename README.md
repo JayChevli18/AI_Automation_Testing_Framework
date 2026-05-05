@@ -270,12 +270,32 @@ Use Swagger UI “Try it out” or send `file=@MyTests.xlsx`.
 
 ---
 
+### `POST /api/tests/runs/list`
+
+- **Purpose:** Paginated run listing for frontend grids (POST request contract with search, filters, sorting).
+- **Body (`RunListRequest`):**
+  - `page`, `limit`
+  - `search` (optional text across run_id/file_id/status/environment)
+  - `sortingOptions`: `{ "sortBy": "created_at|updated_at|run_id|file_id|status|environment", "sortOrder": "asc|desc" }`
+  - `filters`: list of `{ "field", "operator", "value" }`, where `operator` is `equals|contains|gte|lte`.
+- **Response:** `RunListPostResponse` with `data.list` and `data.meta` (`currentPage`, `totalPages`, `totalItems`, `itemsPerPage`, `hasNextPage`, `hasPreviousPage`).
+
+---
+
+### `GET /api/tests/runs/{run_id}/interpreted-steps`
+
+- **Purpose:** Read current interpreted JSON for editor screens.
+- **Response:** `InterpretedStepsReadResponse` with `interpreted_steps` and `revision`.
+
+---
+
 ### `PATCH /api/tests/runs/{run_id}/interpreted-steps`
 
 - **Purpose:** **Merge** manual edits into **`interpreted_steps.json`** without re-running the LLM. Send only the testcase(s) and step row(s) to change.
 - **Body:** `InterpretedStepsPatchRequest` — **`patches`**: list of `{ "test_case_id", "step_patches": [ { "step_index", optional "raw_step" / "interpreted" / "interpretation_error" } ] }` **or** `{ "test_case_id", "steps": [ ... full InterpretedStepRecord list ... ] }` to replace all steps for one case (not both modes in one patch object).
+- **Optimistic lock:** Optional `expected_revision` in the request body. If provided and stale, API returns **409**.
 - **Semantics:** Only JSON keys you include on a step patch are applied (omit a field to leave it unchanged; use JSON **`null`** on **`interpreted`** or **`interpretation_error`** to clear).
-- **Responses:** **`409`** if **`run_meta.status`** is **`running`**; **`404`** if run or file missing; **`422`** if merged JSON fails validation.
+- **Responses:** **`409`** if **`run_meta.status`** is **`running`** or revision mismatched; **`404`** if run or file missing; **`422`** if merged JSON fails validation.
 - **Side effect:** Backs up the previous file to **`interpreted_steps.backup.<UTC_ts>.json`**, then atomically replaces **`interpreted_steps.json`**.
 
 ---
@@ -296,6 +316,22 @@ Use Swagger UI “Try it out” or send `file=@MyTests.xlsx`.
 
 - **Response:** `VersionedExecutionResponse`: **`run_id`**, **`execution_id`** (folder name under **`executions/`**), **`status`**.
 - **Artifacts:** Each call creates **`storage/runs/<run_id>/executions/<execution_id>/`** with **`execution_summary.json`**, **`report.html`**, **`allure-results/`**, **`screenshots/`**, **`html/`**. Appends **`executions/manifest.json`** and updates **`executions/latest.json`**.
+
+---
+
+### `POST /api/tests/runs/{run_id}/cancel`
+
+- **Purpose:** Cooperative cancellation request for in-flight execution.
+- **Behavior:** Marks `cancel_requested=true` in `run_meta`; runner checks this flag between cases/steps and exits with status `cancelled`.
+- **Response:** `CancelRunResponse`.
+
+---
+
+### `POST /api/tests/runs/cleanup`
+
+- **Purpose:** Retention cleanup for old run folders.
+- **Body (`CleanupRunsRequest`):** `retain_days`, `dry_run`, `max_delete`.
+- **Response:** `CleanupRunsResponse` (`deleted_run_ids`, `scanned`).
 
 ---
 
@@ -323,6 +359,19 @@ Use Swagger UI “Try it out” or send `file=@MyTests.xlsx`.
 
 ---
 
+### `GET /api/tests/runs/{run_id}/executions/latest`
+
+- **Purpose:** Return latest versioned execution pointer + manifest row.
+
+---
+
+### `GET /api/tests/runs/{run_id}/artifacts`
+
+- **Purpose:** Consolidated artifact index for UI evidence panels.
+- **Query:** optional `execution_id`; if omitted, backend resolves latest versioned execution when available.
+
+---
+
 ### `GET /api/tests/results/{run_id}`
 
 - **Purpose:** Lightweight status + counts (from root **`execution_summary.json`** when present — see note below).
@@ -331,21 +380,24 @@ Use Swagger UI “Try it out” or send `file=@MyTests.xlsx`.
 
 ### `GET /api/tests/results/{run_id}/summary`
 
-- **Purpose:** Return the full root **`execution_summary.json`** as JSON.
+- **Purpose:** Return execution summary JSON.
+- **Query:** optional `execution_id` to target one versioned execution.
 
-**Note (versioned-only workflows):** If you only use **`/interpret`** + **`/execute-versioned`**, there is **no** root **`execution_summary.json`**; use the **`/versioned/.../summary`** endpoints instead. **`GET /results/{run_id}`** counts may not reflect versioned passes/failures until a full **`/run`** writes the root summary.
+If `execution_id` is omitted, backend prefers root summary and falls back to latest versioned summary when root file is absent.
 
 ---
 
 ### `GET /api/tests/reports/{run_id}`
 
 - **Purpose:** Paths to **Allure** results directory, list of result files, and **`report.html`** path.
+- **Query:** optional `execution_id` to target one versioned execution directly.
 
 ---
 
 ### `GET /api/tests/reports/{run_id}/html`
 
 - **Purpose:** Download/serve the generated **`report.html`** file for that run.
+- **Query:** optional `execution_id` to serve HTML report from a specific versioned execution.
 
 ---
 
@@ -356,7 +408,7 @@ Use Swagger UI “Try it out” or send `file=@MyTests.xlsx`.
 | Path | Description |
 |------|----------------|
 | `input.xlsx` | Copy of the uploaded workbook used for this run. |
-| `run_meta.json` | Run ID, environment, headless, status, timestamps. |
+| `run_meta.json` | Run ID, environment, headless, status, timestamps, `cancel_requested`. |
 | `normalized_testcases.json` | Parsed test cases with `steps[]` and `test_data{}`. |
 | `logs/run.log` | Append-only text log of phases and major events. |
 
@@ -365,6 +417,7 @@ Use Swagger UI “Try it out” or send `file=@MyTests.xlsx`.
 | Path | Description |
 |------|----------------|
 | `interpreted_steps.json` | Structured actions per step (`action`, `target`, `value_key`, …). May be **PATCH**ed manually. |
+| `interpreted_steps.meta.json` | Revision metadata used for optimistic locking (`expected_revision`). |
 | `interpreted_steps.backup.<UTC_ts>.json` | Created when **`PATCH .../interpreted-steps`** runs (previous snapshot). |
 
 **After full `POST /run` only (classic single execution at run root):**
@@ -428,8 +481,9 @@ Sample files may live under `docs/` (e.g. `TestCases_Login_Module_Sample.xlsx`).
 ### `app/main.py`
 
 - **Purpose:** Create the FastAPI `app`, include the tests router under `settings.api_prefix`, run startup hook to ensure storage dirs exist.
+- **Middleware / handlers:** adds `x-request-id` on every response and returns a standardized error envelope for `HTTPException` and unhandled exceptions.
 - **Endpoints defined here:** `GET /health`.
-- **Functions:** `on_startup()`, `health()`.
+- **Functions:** `on_startup()`, `health()`, request-id middleware, global exception handlers.
 
 ---
 
@@ -445,10 +499,15 @@ Sample files may live under `docs/` (e.g. `TestCases_Login_Module_Sample.xlsx`).
 - **Purpose:** All REST endpoints under **`/api/tests`** (plus prefix from config).
 - **Key behaviors:**
   - Validates upload extension and empty files.
+  - **`POST /runs/list`:** Paginated/searchable/sortable run listing.
   - **`POST /run`:** Full pipeline; blocks unsafe live runs unless `allow_live_mutations=true`.
   - **`POST /interpret`:** Interpret only (no browser).
-  - **`PATCH /runs/{run_id}/interpreted-steps`:** Merge manual edits; maps **`ConflictError`** → **409**.
+  - **`GET /runs/{run_id}/interpreted-steps`:** Returns interpreted JSON + revision.
+  - **`PATCH /runs/{run_id}/interpreted-steps`:** Merge manual edits with optional revision lock; maps **`ConflictError`** → **409**.
   - **`POST /execute-versioned`:** Playwright only; versioned execution folders.
+  - **`POST /runs/{run_id}/cancel`:** Cooperative cancellation request.
+  - **`POST /runs/cleanup`:** Retention cleanup/dry-run endpoint.
+  - **`GET /runs/{run_id}/executions/latest`**, **`GET /runs/{run_id}/artifacts`** for frontend helpers.
   - **`GET /versioned/...`:** List executions, summary, report paths, HTML.
   - Delegates to **`RunManager`** and maps exceptions to HTTP errors (`400`, `404`, `403`, `409`, `422`, `503`, `500`).
   - Serves **`report.html`** via **`FileResponse`** (root and versioned).
@@ -465,7 +524,10 @@ Sample files may live under `docs/` (e.g. `TestCases_Login_Module_Sample.xlsx`).
   - `execute_interpreted_cases` — Playwright at **run root** → `execution_summary.json` → **`ReportService`** (used by **`POST /run`**).
   - `interpret_only` — **`create_run`** + normalize + interpret (no browser).
   - `execute_interpreted_versioned` — Playwright under **`executions/<execution_id>/`**, manifest + latest pointer.
-  - `patch_interpreted_steps` — merge **`InterpretedStepsPatchRequest`** into JSON; raises **`ConflictError`** if status is **`running`**.
+  - `patch_interpreted_steps` — merge **`InterpretedStepsPatchRequest`** into JSON; raises **`ConflictError`** if status is **`running`** or revision mismatched.
+  - `request_cancel` — mark run for cooperative cancellation.
+  - `cleanup_runs` — retention cleanup for old run directories.
+  - `get_artifact_index` — consolidated artifact payload for UI.
   - `list_versioned_executions`, `get_versioned_execution_summary`, `get_versioned_report_index` — versioned reads.
   - `get_run_counts`, `get_execution_summary`, `get_report_index` — classic root artifacts.
 - **`_log`:** Writes timestamped lines to console logger **and** `logs/run.log`.
@@ -476,7 +538,7 @@ Sample files may live under `docs/` (e.g. `TestCases_Login_Module_Sample.xlsx`).
 
 - **Purpose:** All filesystem operations for uploads and runs.
 - **Examples:** `save_upload`, `create_run`, `write_json`, `read_json`, `append_text`, `update_run_status`, `get_run_dir`.
-- **Versioned / patch helpers:** `create_versioned_execution_dir`, `write_json_relative`, `read_json_relative`, `update_run_execution_options`, `read_execution_manifest`, `append_execution_manifest`, `write_latest_execution_pointer`, `get_latest_execution_id`, `backup_interpreted_steps_if_exists`, `atomic_write_interpreted_steps`.
+- **Versioned / patch helpers:** `create_versioned_execution_dir`, `write_json_relative`, `read_json_relative`, `update_run_execution_options`, `read_execution_manifest`, `append_execution_manifest`, `write_latest_execution_pointer`, `get_latest_execution_id`, `backup_interpreted_steps_if_exists`, `atomic_write_interpreted_steps`, interpreted revision helpers (`get_interpreted_revision`, `set_interpreted_revision`), cancellation helpers (`request_cancel_run`, `is_cancel_requested`), and retention helper (`delete_run_dir`).
 
 ---
 
@@ -559,8 +621,8 @@ Sample files may live under `docs/` (e.g. `TestCases_Login_Module_Sample.xlsx`).
 | File | Contains |
 |------|----------|
 | `request_models.py` | **`RunRequest`**, **`InterpretRunRequest`**, **`ExecuteFromInterpretedRequest`**, **`InterpretedStepsPatchRequest`**, **`StepPatchItem`**, **`InterpretedCasePatch`**. |
-| `response_models.py` | API responses including **`VersionedExecutionResponse`**, **`VersionedExecutionsListResponse`**, **`VersionedExecutionSummaryResponse`**, **`InterpretedStepsPatchResponse`**. |
-| `run_models.py` | **`RunMeta`**, **`UploadedFileMeta`**. |
+| `response_models.py` | API responses including list pagination responses, **`VersionedExecutionResponse`**, **`VersionedExecutionsListResponse`**, **`VersionedExecutionSummaryResponse`**, **`InterpretedStepsPatchResponse`**, cancellation/cleanup responses, and artifact index response. |
+| `run_models.py` | **`RunMeta`** (includes `cancel_requested`), **`UploadedFileMeta`**. |
 | `testcase_models.py` | **`RawExcelRow`**, **`NormalizedTestCase`**. |
 | `interpreted_models.py` | **`InterpretedStep`**, records for **`interpreted_steps.json`**. |
 | `execution_models.py` | **`StepExecutionResult`**, **`CaseExecutionResult`**, **`RunExecutionSummary`**. |
@@ -569,7 +631,7 @@ Sample files may live under `docs/` (e.g. `TestCases_Login_Module_Sample.xlsx`).
 
 ### `app/core/constants.py`
 
-- **Purpose:** Run status strings: `queued`, `interpreted`, `running`, `completed`, `failed`.
+- **Purpose:** Run status strings: `queued`, `interpreted`, `running`, `completed`, `failed`, `cancelled`.
 
 ---
 
@@ -1017,9 +1079,12 @@ Open **`http://127.0.0.1:8000/docs`** to try uploads and runs.
 
 - **Long `/run` requests:** The run endpoint waits until the whole pipeline finishes. For huge suites, watch **`storage/runs/<run_id>/logs/run.log`** or call **`/results/{run_id}`** from another client while one request is in flight (same server).
 - **Interpret + execute-versioned:** Use **`/interpret`** once per uploaded workbook snapshot, then **`/execute-versioned`** many times. Each execute creates a **new** folder under **`executions/`**; inspect **`manifest.json`** or **`latest.json`** for the newest **`execution_id`**.
-- **Editing interpreted JSON:** Do not **`PATCH`** while **`execute-versioned`** (or **`/run`**) is in progress for that **`run_id`** — the API returns **409**. After editing, the next **`execute-versioned`** uses the updated file.
+- **Editing interpreted JSON:** Do not **`PATCH`** while **`execute-versioned`** (or **`/run`**) is in progress for that **`run_id`** — the API returns **409**. You can optionally send `expected_revision` for optimistic lock; mismatches also return **409**.
+- **Cancellation:** `POST /runs/{run_id}/cancel` is cooperative (checked between testcases/steps), not an immediate process kill.
+- **Cleanup:** `POST /runs/cleanup` supports `dry_run=true` so you can review candidate deletions before actual cleanup.
 - **Consistency:** LLM output can vary between runs. The codebase mitigates this with **prompt rules**, **fill normalization**, **executor preference for `test_data`**, optional **PATCH**, and the **split pipeline** so you can lock interpretation once.
 - **Live safety:** Default **`environment=live`** blocks destructive steps unless **`allow_live_mutations=true`** in the JSON body (**`/run`** and **`/execute-versioned`**).
+- **Error handling contract:** API errors now include a standardized envelope with `code`, `message`, `details`, and `request_id`, and responses include `x-request-id`.
 
 ---
 
