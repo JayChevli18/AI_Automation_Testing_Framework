@@ -29,6 +29,8 @@ class TestRunner:
         interpreted_cases: list[InterpretedCaseRecord],
         run_dir: Path,
         run_logger: Callable[[str, str], None] | None = None,
+        *,
+        artifact_base_dir: Path | None = None,
     ) -> RunExecutionSummary:
         case_map = {c.test_case_id: c for c in cases}
         interpreted_map = {c.test_case_id: c for c in interpreted_cases}
@@ -36,8 +38,11 @@ class TestRunner:
         passed = 0
         failed = 0
 
-        screenshots_dir = run_dir / "screenshots"
-        html_dir = run_dir / "html"
+        artifact_root = artifact_base_dir if artifact_base_dir is not None else run_dir
+        screenshots_dir = artifact_root / "screenshots"
+        html_dir = artifact_root / "html"
+        screenshots_dir.mkdir(parents=True, exist_ok=True)
+        html_dir.mkdir(parents=True, exist_ok=True)
         step_timeout = run_meta.step_timeout_ms or settings.default_timeout_ms
 
         async with async_playwright() as p:

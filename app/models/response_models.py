@@ -59,3 +59,38 @@ class RunReportResponse(BaseModel):
     allure_result_files: list[str]
     html_report_path: str
 
+
+class VersionedExecutionResponse(BaseModel):
+    """Response after a versioned browser execution under executions/<id>/."""
+
+    success: bool
+    run_id: str
+    execution_id: str
+    status: str
+
+
+class VersionedExecutionsListResponse(BaseModel):
+    """List of recorded versioned executions for a run."""
+
+    success: bool
+    run_id: str
+    executions: list[dict]
+
+
+class VersionedExecutionSummaryResponse(BaseModel):
+    """Full execution summary for one versioned execution."""
+
+    success: bool
+    run_id: str
+    execution_id: str
+    summary: dict
+
+
+class InterpretedStepsPatchResponse(BaseModel):
+    """Response after PATCH merged into interpreted_steps.json."""
+
+    success: bool
+    run_id: str
+    patched_test_case_ids: list[str]
+    message: str = ""
+
