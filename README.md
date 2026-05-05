@@ -21,6 +21,9 @@ You (or your QA team) write test cases in an **Excel file** using plain language
 - **Local AI:** Use **Ollama** so test data and prompts can stay on your environment (no cloud LLM required for the designed flow).
 - **Traceability:** Every run gets a **unique folder** with input Excel, intermediate JSON, logs, screenshots, and summaries.
 - **Reporting:** Build **Allure-style** result files and an **HTML dashboard** per run for review.
+- **Split interpret vs execute (optional):** Run the LLM **once** per workbook snapshot, then replay **browser-only** executions as often as needed—see **`POST /interpret`** and **`POST /execute-versioned`**.
+- **Versioned executions:** Repeated browser runs for the same `run_id` can be stored under **`executions/exec_<timestamp>_<id>/`** so prior reports and screenshots are not overwritten.
+- **Manual fixes:** **`PATCH`** a run’s **`interpreted_steps.json`** to correct bad LLM output without re-calling Ollama.
 
 ---
 
@@ -43,6 +46,14 @@ flowchart LR
 4. **Interpret:** For each manual step, **Ollama** returns a small JSON action (`goto`, `click`, `fill`, etc.) (`interpreted_steps.json`).
 5. **Execute:** **Playwright** drives Chromium against **`BETA_BASE_URL`** or **`LIVE_BASE_URL`** from `.env`, step by step.
 6. **Report:** Writes **`execution_summary.json`**, **Allure** JSON files under `allure-results/`, and **`report.html`**.
+
+**Optional two-phase flow (same Excel, many browser runs, one LLM pass):**
+
+1. **Upload** → `file_id` (unchanged).
+2. **`POST /interpret`** with the same JSON shape as **`/run`** (`InterpretRunRequest`). Creates **`run_id`**, **normalize** + **interpret** only; status ends at **`interpreted`**. No Playwright.
+3. *(Optional)* **`PATCH /runs/{run_id}/interpreted-steps`** to merge manual edits into **`interpreted_steps.json`** (e.g. fix a wrong `action` / `target`).
+4. **`POST /execute-versioned`** with **`interpret_run_id`** = that **`run_id`**. Loads **`interpreted_steps.json`** + **`normalized_testcases.json`**, runs Playwright, writes artifacts under **`executions/exec_<UTC>_<suffix>/`** (new folder per invocation). **No LLM** on this call.
+5. **Read results** via **`GET /versioned/{run_id}/executions/...`** (list, summary, HTML report) for versioned runs.
 
 ---
 
@@ -91,8 +102,8 @@ flowchart TB
 
 | Layer | Responsibility |
 |--------|----------------|
-| **API** | HTTP endpoints: upload, run, status, summary, reports. |
-| **Run manager** | Single place that orders phases and writes run logs. |
+| **API** | HTTP endpoints: upload, full **`/run`**, **`/interpret`**, **`/execute-versioned`**, **`PATCH`** interpreted steps, versioned execution reads, status, summary, reports. |
+| **Run manager** | Single place that orders phases and writes run logs; split interpret/execute and versioned execution paths. |
 | **Excel + normalizer** | Excel → structured test cases. |
 | **Ollama client + interpreter** | Natural language step → JSON action. |
 | **Test runner + executor** | Playwright runs actions; locator engine finds elements. |
@@ -251,15 +262,78 @@ Use Swagger UI “Try it out” or send `file=@MyTests.xlsx`.
 
 ---
 
+### `POST /api/tests/interpret`
+
+- **Purpose:** **Normalize + interpret only** (Ollama per step). Does **not** start Playwright. Same request body as **`/run`** (`InterpretRunRequest` — same fields as **`RunRequest`**).
+- **Response:** `RunResponse` with **`run_id`** and status **`interpreted`** (when successful).
+- **Use with:** **`POST /execute-versioned`** and optional **`PATCH .../interpreted-steps`**.
+
+---
+
+### `PATCH /api/tests/runs/{run_id}/interpreted-steps`
+
+- **Purpose:** **Merge** manual edits into **`interpreted_steps.json`** without re-running the LLM. Send only the testcase(s) and step row(s) to change.
+- **Body:** `InterpretedStepsPatchRequest` — **`patches`**: list of `{ "test_case_id", "step_patches": [ { "step_index", optional "raw_step" / "interpreted" / "interpretation_error" } ] }` **or** `{ "test_case_id", "steps": [ ... full InterpretedStepRecord list ... ] }` to replace all steps for one case (not both modes in one patch object).
+- **Semantics:** Only JSON keys you include on a step patch are applied (omit a field to leave it unchanged; use JSON **`null`** on **`interpreted`** or **`interpretation_error`** to clear).
+- **Responses:** **`409`** if **`run_meta.status`** is **`running`**; **`404`** if run or file missing; **`422`** if merged JSON fails validation.
+- **Side effect:** Backs up the previous file to **`interpreted_steps.backup.<UTC_ts>.json`**, then atomically replaces **`interpreted_steps.json`**.
+
+---
+
+### `POST /api/tests/execute-versioned`
+
+- **Purpose:** **Browser execution only** using an existing run folder’s **`interpreted_steps.json`** and **`normalized_testcases.json`**. **No Ollama** calls.
+- **Body (`ExecuteFromInterpretedRequest`):**
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `interpret_run_id` | string | **`run_id`** from **`POST /interpret`** (or any run that already has interpreted JSON). |
+| `environment` | `"beta"` \| `"live"` | Same as **`/run`**. |
+| `headless` | boolean | |
+| `continue_on_failure` | boolean | |
+| `step_timeout_ms` | number | |
+| `allow_live_mutations` | boolean | **Required `true`** for **`environment=live`** when steps mutate the site (**403** otherwise). |
+
+- **Response:** `VersionedExecutionResponse`: **`run_id`**, **`execution_id`** (folder name under **`executions/`**), **`status`**.
+- **Artifacts:** Each call creates **`storage/runs/<run_id>/executions/<execution_id>/`** with **`execution_summary.json`**, **`report.html`**, **`allure-results/`**, **`screenshots/`**, **`html/`**. Appends **`executions/manifest.json`** and updates **`executions/latest.json`**.
+
+---
+
+### `GET /api/tests/versioned/{run_id}/executions`
+
+- **Purpose:** List recorded versioned executions (manifest entries).
+
+---
+
+### `GET /api/tests/versioned/{run_id}/executions/{execution_id}/summary`
+
+- **Purpose:** Full **`execution_summary.json`** for that **`execution_id`**.
+
+---
+
+### `GET /api/tests/versioned/{run_id}/executions/{execution_id}/reports`
+
+- **Purpose:** Paths to Allure dir, file list, and **`report.html`** **inside** that execution folder.
+
+---
+
+### `GET /api/tests/versioned/{run_id}/executions/{execution_id}/report.html`
+
+- **Purpose:** Serve the HTML dashboard for that versioned execution.
+
+---
+
 ### `GET /api/tests/results/{run_id}`
 
-- **Purpose:** Lightweight status + counts (from `execution_summary.json` when available).
+- **Purpose:** Lightweight status + counts (from root **`execution_summary.json`** when present — see note below).
 
 ---
 
 ### `GET /api/tests/results/{run_id}/summary`
 
-- **Purpose:** Return the full **`execution_summary.json`** content as JSON (every testcase and step outcome).
+- **Purpose:** Return the full root **`execution_summary.json`** as JSON.
+
+**Note (versioned-only workflows):** If you only use **`/interpret`** + **`/execute-versioned`**, there is **no** root **`execution_summary.json`**; use the **`/versioned/.../summary`** endpoints instead. **`GET /results/{run_id}`** counts may not reflect versioned passes/failures until a full **`/run`** writes the root summary.
 
 ---
 
@@ -277,20 +351,52 @@ Use Swagger UI “Try it out” or send `file=@MyTests.xlsx`.
 
 ## 9. What gets saved per run (`storage/runs/<run_id>/`)
 
-After a successful pipeline, you typically see:
+**Always (after create + normalize):**
 
 | Path | Description |
 |------|----------------|
 | `input.xlsx` | Copy of the uploaded workbook used for this run. |
 | `run_meta.json` | Run ID, environment, headless, status, timestamps. |
 | `normalized_testcases.json` | Parsed test cases with `steps[]` and `test_data{}`. |
-| `interpreted_steps.json` | LLM output per step (`action`, `target`, `value_key`, …). |
-| `execution_summary.json` | Pass/fail per step, URLs, errors, screenshot paths. |
 | `logs/run.log` | Append-only text log of phases and major events. |
-| `screenshots/` | PNG screenshots (often on failure). |
-| `html/` | HTML snapshots of the page when useful for debugging. |
-| `allure-results/` | JSON files consumable by Allure CLI if you generate a full Allure site. |
-| `report.html` | Standalone HTML dashboard produced by `ReportService`. |
+
+**After interpret (LLM) or full `/run`:**
+
+| Path | Description |
+|------|----------------|
+| `interpreted_steps.json` | Structured actions per step (`action`, `target`, `value_key`, …). May be **PATCH**ed manually. |
+| `interpreted_steps.backup.<UTC_ts>.json` | Created when **`PATCH .../interpreted-steps`** runs (previous snapshot). |
+
+**After full `POST /run` only (classic single execution at run root):**
+
+| Path | Description |
+|------|----------------|
+| `execution_summary.json` | Pass/fail per step, URLs, errors, screenshot paths. |
+| `screenshots/` | PNG screenshots (evidence / failures). |
+| `html/` | HTML snapshots for debugging. |
+| `allure-results/` | Allure JSON files. |
+| `report.html` | HTML dashboard at **run root**. |
+
+**After `POST /execute-versioned` (each browser invocation):**
+
+Under **`executions/exec_<YYYYMMDD_HHMMSS>_<suffix>/`** (unique **`execution_id`** per call):
+
+| Path | Description |
+|------|----------------|
+| `execution_summary.json` | Summary for **this** execution only. |
+| `report.html` | Dashboard for **this** execution. |
+| `allure-results/` | Allure JSON for **this** execution. |
+| `screenshots/` | Screenshots for **this** execution. |
+| `html/` | HTML dumps for **this** execution. |
+
+At **`executions/`** root (same run folder):
+
+| Path | Description |
+|------|----------------|
+| `manifest.json` | Append-only list of versioned executions (timestamps, status, counts). |
+| `latest.json` | `{"execution_id": "..."}` — last **`execute-versioned`** completion. |
+
+Empty **`screenshots/`** and **`html/`** may also exist at **run root** from **`create_run`**; the versioned path is what **`execute-versioned`** uses for new evidence.
 
 ---
 
@@ -339,9 +445,13 @@ Sample files may live under `docs/` (e.g. `TestCases_Login_Module_Sample.xlsx`).
 - **Purpose:** All REST endpoints under **`/api/tests`** (plus prefix from config).
 - **Key behaviors:**
   - Validates upload extension and empty files.
-  - **`POST /run`:** Blocks unsafe live runs unless `allow_live_mutations=true`.
-  - Delegates to **`RunManager`** and maps exceptions to HTTP errors (`404`, `403`, `503`, `500`).
-  - Serves **`report.html`** via **`FileResponse`**.
+  - **`POST /run`:** Full pipeline; blocks unsafe live runs unless `allow_live_mutations=true`.
+  - **`POST /interpret`:** Interpret only (no browser).
+  - **`PATCH /runs/{run_id}/interpreted-steps`:** Merge manual edits; maps **`ConflictError`** → **409**.
+  - **`POST /execute-versioned`:** Playwright only; versioned execution folders.
+  - **`GET /versioned/...`:** List executions, summary, report paths, HTML.
+  - Delegates to **`RunManager`** and maps exceptions to HTTP errors (`400`, `404`, `403`, `409`, `422`, `503`, `500`).
+  - Serves **`report.html`** via **`FileResponse`** (root and versioned).
 
 ---
 
@@ -352,8 +462,12 @@ Sample files may live under `docs/` (e.g. `TestCases_Login_Module_Sample.xlsx`).
   - `create_run` — creates folder + `run_meta.json`.
   - `generate_normalized_testcases` — Excel → `normalized_testcases.json`.
   - `generate_interpreted_steps` — Ollama per step → `interpreted_steps.json`; may fail fast if Ollama is entirely down.
-  - `execute_interpreted_cases` — Playwright execution → `execution_summary.json` → calls **`ReportService`** for Allure + HTML.
-  - `get_run_counts`, `get_execution_summary`, `get_report_index` — support API reads.
+  - `execute_interpreted_cases` — Playwright at **run root** → `execution_summary.json` → **`ReportService`** (used by **`POST /run`**).
+  - `interpret_only` — **`create_run`** + normalize + interpret (no browser).
+  - `execute_interpreted_versioned` — Playwright under **`executions/<execution_id>/`**, manifest + latest pointer.
+  - `patch_interpreted_steps` — merge **`InterpretedStepsPatchRequest`** into JSON; raises **`ConflictError`** if status is **`running`**.
+  - `list_versioned_executions`, `get_versioned_execution_summary`, `get_versioned_report_index` — versioned reads.
+  - `get_run_counts`, `get_execution_summary`, `get_report_index` — classic root artifacts.
 - **`_log`:** Writes timestamped lines to console logger **and** `logs/run.log`.
 
 ---
@@ -362,6 +476,7 @@ Sample files may live under `docs/` (e.g. `TestCases_Login_Module_Sample.xlsx`).
 
 - **Purpose:** All filesystem operations for uploads and runs.
 - **Examples:** `save_upload`, `create_run`, `write_json`, `read_json`, `append_text`, `update_run_status`, `get_run_dir`.
+- **Versioned / patch helpers:** `create_versioned_execution_dir`, `write_json_relative`, `read_json_relative`, `update_run_execution_options`, `read_execution_manifest`, `append_execution_manifest`, `write_latest_execution_pointer`, `get_latest_execution_id`, `backup_interpreted_steps_if_exists`, `atomic_write_interpreted_steps`.
 
 ---
 
@@ -398,6 +513,7 @@ Sample files may live under `docs/` (e.g. `TestCases_Login_Module_Sample.xlsx`).
 
 - **Purpose:** Async Playwright orchestration.
 - **Behavior:** For **each test case**, launches a **new Chromium** browser (so cases are isolated), creates page, runs all interpreted steps with **`ActionExecutor`**, uses **`SelectorCache`** per testcase, picks **`beta_base_url`** vs **`live_base_url`** from environment.
+- **Optional:** Keyword argument **`artifact_base_dir`** — when set (e.g. by **`execute_interpreted_versioned`**), screenshots and HTML dumps go under that directory instead of **run root** (defaults preserve **`POST /run`** behavior).
 - **Returns:** **`RunExecutionSummary`** aggregate.
 
 ---
@@ -442,8 +558,8 @@ Sample files may live under `docs/` (e.g. `TestCases_Login_Module_Sample.xlsx`).
 
 | File | Contains |
 |------|----------|
-| `request_models.py` | **`RunRequest`** — fields for `/run`. |
-| `response_models.py` | API response shapes (`UploadResponse`, `RunResponse`, …). |
+| `request_models.py` | **`RunRequest`**, **`InterpretRunRequest`**, **`ExecuteFromInterpretedRequest`**, **`InterpretedStepsPatchRequest`**, **`StepPatchItem`**, **`InterpretedCasePatch`**. |
+| `response_models.py` | API responses including **`VersionedExecutionResponse`**, **`VersionedExecutionsListResponse`**, **`VersionedExecutionSummaryResponse`**, **`InterpretedStepsPatchResponse`**. |
 | `run_models.py` | **`RunMeta`**, **`UploadedFileMeta`**. |
 | `testcase_models.py` | **`RawExcelRow`**, **`NormalizedTestCase`**. |
 | `interpreted_models.py` | **`InterpretedStep`**, records for **`interpreted_steps.json`**. |
@@ -459,7 +575,7 @@ Sample files may live under `docs/` (e.g. `TestCases_Login_Module_Sample.xlsx`).
 
 ### `app/core/exceptions.py`
 
-- **Purpose:** Shared exception types (`NotFoundError`, etc.) for clean API error mapping.
+- **Purpose:** Shared exception types for clean API error mapping (**`NotFoundError`**, **`ConflictError`**, etc.).
 
 ---
 
@@ -522,10 +638,17 @@ Legend — **Called from:**
 |------|------|---------|-------------|---------|
 | `upload_test_file` | `POST /api/tests/upload` | Validates `.xlsx`/`.xls`, saves bytes via `StorageService.save_upload`, returns `file_id`. | Postman / Swagger | Upload `Login.xlsx` → get `f_...` |
 | `start_run` | `POST /api/tests/run` | Validates live safety → `RunManager.create_run` → normalize → interpret → execute → reports; maps errors to HTTP status. | Client after upload | Body `{"file_id":"f_..."}` |
+| `start_interpret_only` | `POST /api/tests/interpret` | `RunManager.interpret_only` — LLM only. | Split pipeline | — |
+| `patch_interpreted_steps` | `PATCH /api/tests/runs/{run_id}/interpreted-steps` | `RunManager.patch_interpreted_steps`; **409** on conflict. | Manual JSON fixes | — |
+| `start_execute_versioned` | `POST /api/tests/execute-versioned` | `RunManager.execute_interpreted_versioned`. | Replay without LLM | — |
+| `list_versioned_executions_for_run` | `GET /api/tests/versioned/{run_id}/executions` | Manifest list. | UI / scripts | — |
+| `get_versioned_execution_summary_api` | `GET .../versioned/.../summary` | One execution summary. | Reporting | — |
+| `get_versioned_report_artifacts` | `GET .../versioned/.../reports` | Allure + HTML paths under `executions/<id>/`. | Integration | — |
+| `get_versioned_report_html` | `GET .../versioned/.../report.html` | `FileResponse` for versioned report. | Browser | — |
 | `get_run_results` | `GET /api/tests/results/{run_id}` | Returns `run_meta.status` + `get_run_counts`. | Polling UI | — |
-| `get_run_execution_summary` | `GET /api/tests/results/{run_id}/summary` | Full `execution_summary.json` payload. | Reporting tools | — |
-| `get_run_report_artifacts` | `GET /api/tests/reports/{run_id}` | Paths to Allure dir, file list, `report.html`. | Frontend integration | — |
-| `get_run_report_html` | `GET /api/tests/reports/{run_id}/html` | Serves `report.html` as `FileResponse`. | Browser open report | — |
+| `get_run_execution_summary` | `GET /api/tests/results/{run_id}/summary` | Full root `execution_summary.json` payload. | Reporting tools | — |
+| `get_run_report_artifacts` | `GET /api/tests/reports/{run_id}` | Paths to Allure dir, file list, root `report.html`. | Frontend integration | — |
+| `get_run_report_html` | `GET /api/tests/reports/{run_id}/html` | Serves root `report.html` as `FileResponse`. | Browser open report | — |
 
 ---
 
@@ -535,14 +658,19 @@ Legend — **Called from:**
 |--------|---------|-------------|---------|
 | `__init__` | Wires `StorageService`, `ExcelParser`, `TestcaseNormalizer`, `StepInterpreter`, `TestRunner`, `ReportService`. | App startup when router imports `RunManager()` | — |
 | `_log(run_id, message)` | Appends timestamped line to console logger **and** `logs/run.log`. | Internal phases | `"phase=normalize status=start"` |
-| `create_run(request)` | Delegates to `storage_service.create_run` with request fields + `allow_live_mutations`. | `start_run` | After upload |
+| `create_run(request)` | Delegates to `storage_service.create_run` with request fields + `allow_live_mutations`. | `start_run`, `interpret_only` | After upload |
 | `get_run(run_id)` | Reads `run_meta.json`. | API results endpoints | — |
-| `get_run_counts(run_id, status)` | Prefers counts from `execution_summary.json`; else pending count from normalized list. | `get_run_results` | — |
-| `generate_normalized_testcases(run_id)` | Reads `input.xlsx`, parse → normalize → writes `normalized_testcases.json`. | `start_run` | Phase 1 |
-| `generate_interpreted_steps(run_id)` | For each step calls `step_interpreter.try_interpret_step`; writes `interpreted_steps.json`; may raise `ConnectionError` if Ollama totally fails. | `start_run` | Phase 2 |
-| `execute_interpreted_cases(run_id)` | Sets status running → `asyncio.run(test_runner.run(...))` → writes `execution_summary.json` → `report_service.write_allure_results` + `write_html_report` → final status. | `start_run` | Phase 3–4 |
-| `get_execution_summary(run_id)` | Reads `execution_summary.json` as dict. | `get_run_execution_summary` | — |
-| `get_report_index(run_id)` | Lists Allure files and path to `report.html`. | Report API routes | — |
+| `get_run_counts(run_id, status)` | Prefers counts from root `execution_summary.json`; else pending count from normalized list. | `get_run_results` | — |
+| `generate_normalized_testcases(run_id)` | Reads `input.xlsx`, parse → normalize → writes `normalized_testcases.json`. | `start_run`, `interpret_only` | Phase 1 |
+| `generate_interpreted_steps(run_id)` | For each step calls `step_interpreter.try_interpret_step`; writes `interpreted_steps.json`; may raise `ConnectionError` if Ollama totally fails. | `start_run`, `interpret_only` | Phase 2 |
+| `execute_interpreted_cases(run_id)` | Sets status running → `asyncio.run(test_runner.run(...))` → writes **root** `execution_summary.json` → `report_service` → final status. | `start_run` | Phase 3–4 |
+| `interpret_only(request)` | `create_run` + normalize + interpret. | `start_interpret_only` | — |
+| `execute_interpreted_versioned(request)` | Versioned dir + `test_runner.run(..., artifact_base_dir=...)`. | `start_execute_versioned` | — |
+| `patch_interpreted_steps(run_id, request)` | Merge PATCH into `interpreted_steps.json`. | `patch_interpreted_steps` route | — |
+| `_merge_step_record` | Applies one `StepPatchItem` using `model_fields_set`. | `patch_interpreted_steps` | — |
+| `list_versioned_executions` / `get_versioned_execution_summary` / `get_versioned_report_index` | Versioned artifact reads. | Versioned GET routes | — |
+| `get_execution_summary(run_id)` | Reads **root** `execution_summary.json` as dict. | `get_run_execution_summary` | — |
+| `get_report_index(run_id)` | Lists Allure files and path to **root** `report.html`. | Report API routes | — |
 
 ---
 
@@ -561,6 +689,11 @@ Legend — **Called from:**
 | `write_json(run_id, name, payload)` | Writes JSON file under run dir. | RM | `normalized_testcases.json` |
 | `read_json(run_id, name)` | Reads JSON artifact. | RM, APIs | — |
 | `write_text` / `append_text` | Plain text files (logs). | RM `_log` uses `append_text` | `logs/run.log` |
+| `create_versioned_execution_dir` | Creates `executions/exec_<ts>_<id>/` + subdirs. | `execute_interpreted_versioned` | — |
+| `write_json_relative` / `read_json_relative` | Nested JSON paths under run dir (validated). | RM versioned summary path | — |
+| `update_run_execution_options` | Patches `run_meta` execution fields before versioned execute. | `execute_interpreted_versioned` | — |
+| `read_execution_manifest` / `append_execution_manifest` / `write_latest_execution_pointer` / `get_latest_execution_id` | Versioned execution index. | RM | — |
+| `backup_interpreted_steps_if_exists` / `atomic_write_interpreted_steps` | Safe PATCH of interpreted JSON. | `patch_interpreted_steps` | — |
 | `_write_upload_meta` | Saves upload metadata JSON next to upload file. | `save_upload` | — |
 | `_get_upload_path_by_file_id` | Finds `.xlsx`/`.xls` matching `file_id`. | `create_run` | — |
 
@@ -623,7 +756,7 @@ Legend — **Called from:**
 | Method | Purpose | Called from | Example |
 |--------|---------|-------------|---------|
 | `__init__(action_executor)` | Injects or creates `ActionExecutor`. | `RunManager` | — |
-| `run(run_meta, cases, interpreted_cases, run_dir, run_logger)` | Async: for each testcase launches **new Chromium**, `SelectorCache`, loops steps calling `action_executor.execute_step`, builds `RunExecutionSummary`. | `RunManager.execute_interpreted_cases` via `asyncio.run` | — |
+| `run(run_meta, cases, interpreted_cases, run_dir, run_logger, artifact_base_dir=None)` | Async: for each testcase launches **new Chromium**, `SelectorCache`, loops steps calling `action_executor.execute_step`, builds `RunExecutionSummary`. Optional **`artifact_base_dir`** for versioned evidence dirs. | `execute_interpreted_cases`, `execute_interpreted_versioned` via `asyncio.run` | — |
 
 ---
 
@@ -670,9 +803,9 @@ Legend — **Called from:**
 
 | Method | Purpose | Called from | Example |
 |--------|---------|-------------|---------|
-| `write_allure_results(run_dir, summary)` | Creates `allure-results/`, one `*-result.json` per testcase with steps + attachment refs. | `execute_interpreted_cases` | Allure CLI can ingest later |
+| `write_allure_results(run_dir, summary)` | Creates `allure-results/`, one `*-result.json` per testcase with steps + attachment refs. | `execute_interpreted_cases`, `execute_interpreted_versioned` | Allure CLI can ingest later |
 | `_write_case_result(...)` | Builds single Allure JSON payload for one `CaseExecutionResult`. | `write_allure_results` | — |
-| `write_html_report(run_dir, summary)` | Writes `report.html` dashboard. | `execute_interpreted_cases` | Open in browser |
+| `write_html_report(run_dir, summary)` | Writes `report.html` dashboard under **`run_dir`**. | `execute_interpreted_cases`, `execute_interpreted_versioned` | Open in browser |
 | `_build_html(summary)` | Large HTML string with tables, links to screenshots/HTML. | `write_html_report` | — |
 | `_to_run_relative_href(path)` | Makes relative links work when opening `report.html` from disk. | `_build_html` | — |
 
@@ -693,6 +826,7 @@ Legend — **Called from:**
 | `AppError` | Base exception. | Subclassing |
 | `StorageError` | Storage failures (reserved). | Future |
 | `NotFoundError` | Missing run/upload/file. | Mapped to HTTP 404 |
+| `ConflictError` | Invalid state for the request (e.g. PATCH while run **running**). | Mapped to HTTP 409 |
 
 ---
 
@@ -882,8 +1016,10 @@ Open **`http://127.0.0.1:8000/docs`** to try uploads and runs.
 ## 14. Operational notes
 
 - **Long `/run` requests:** The run endpoint waits until the whole pipeline finishes. For huge suites, watch **`storage/runs/<run_id>/logs/run.log`** or call **`/results/{run_id}`** from another client while one request is in flight (same server).
-- **Consistency:** LLM output can vary between runs. The codebase mitigates this with **prompt rules**, **fill normalization**, and **executor preference for `test_data`**. For maximum stability, future work can add **fully deterministic rules** for repeated patterns.
-- **Live safety:** Default **`environment=live`** blocks destructive steps unless **`allow_live_mutations=true`** in the JSON body.
+- **Interpret + execute-versioned:** Use **`/interpret`** once per uploaded workbook snapshot, then **`/execute-versioned`** many times. Each execute creates a **new** folder under **`executions/`**; inspect **`manifest.json`** or **`latest.json`** for the newest **`execution_id`**.
+- **Editing interpreted JSON:** Do not **`PATCH`** while **`execute-versioned`** (or **`/run`**) is in progress for that **`run_id`** — the API returns **409**. After editing, the next **`execute-versioned`** uses the updated file.
+- **Consistency:** LLM output can vary between runs. The codebase mitigates this with **prompt rules**, **fill normalization**, **executor preference for `test_data`**, optional **PATCH**, and the **split pipeline** so you can lock interpretation once.
+- **Live safety:** Default **`environment=live`** blocks destructive steps unless **`allow_live_mutations=true`** in the JSON body (**`/run`** and **`/execute-versioned`**).
 
 ---
 
@@ -898,12 +1034,11 @@ Open **`http://127.0.0.1:8000/docs`** to try uploads and runs.
 
 | Term | Meaning |
 |------|---------|
-| **Run** | One full execution from one uploaded Excel snapshot identified by **`run_id`**. |
+| **Run** | One workspace folder **`storage/runs/<run_id>/`** tied to one copied Excel snapshot (from **`file_id`**). |
 | **Normalize** | Convert Excel rows into clean JSON test cases. |
-| **Interpret** | Convert each manual step string into a structured action via **Ollama**. |
-| **Execute** | Drive the browser using **Playwright**. |
+| **Interpret** | Convert each manual step string into a structured action via **Ollama** → **`interpreted_steps.json`**. |
+| **Execute** | Drive the browser using **Playwright** (full **`/run`** at run root, or **`execute-versioned`** under **`executions/<execution_id>/`**). |
+| **execution_id** | Folder name **`exec_<timestamp>_<suffix>`** for one versioned browser run. |
 | **Headless** | Browser runs without a visible window; **`headless: false`** shows the window. |
 
 ---
-
-*End of README.*
