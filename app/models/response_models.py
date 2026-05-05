@@ -184,3 +184,10 @@ class CleanupRunsResponse(BaseModel):
     deleted_run_ids: list[str]
     scanned: int
 
+
+class RunMetricsResponse(BaseModel):
+    """Simple backend counters for dashboard cards."""
+
+    success: bool
+    metrics: dict
+

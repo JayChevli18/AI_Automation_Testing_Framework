@@ -25,6 +25,7 @@ from app.models.response_models import (
     InterpretedStepsPatchResponse,
     LatestExecutionResponse,
     RunExecutionSummaryResponse,
+    RunMetricsResponse,
     RunListData,
     RunListItem,
     RunListMeta,
@@ -46,6 +47,20 @@ logger = get_logger(__name__)
 
 storage_service = StorageService()
 run_manager = RunManager(storage_service=storage_service)
+
+
+@router.get("/metrics", response_model=RunMetricsResponse)
+def get_metrics() -> RunMetricsResponse:
+    """Simple counters for dashboard widgets."""
+    try:
+        metrics = run_manager.get_metrics()
+    except Exception as exc:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to build metrics: {exc}",
+        ) from exc
+
+    return RunMetricsResponse(success=True, metrics=metrics)
 
 
 @router.post("/runs/list", response_model=RunListPostResponse)
