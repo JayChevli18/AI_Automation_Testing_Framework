@@ -29,6 +29,7 @@ class TestRunner:
         interpreted_cases: list[InterpretedCaseRecord],
         run_dir: Path,
         run_logger: Callable[[str, str], None] | None = None,
+        should_cancel: Callable[[], bool] | None = None,
         *,
         artifact_base_dir: Path | None = None,
     ) -> RunExecutionSummary:
@@ -37,6 +38,7 @@ class TestRunner:
         results: list[CaseExecutionResult] = []
         passed = 0
         failed = 0
+        cancelled = False
 
         artifact_root = artifact_base_dir if artifact_base_dir is not None else run_dir
         screenshots_dir = artifact_root / "screenshots"
@@ -47,6 +49,14 @@ class TestRunner:
 
         async with async_playwright() as p:
             for test_case_id, case in case_map.items():
+                if should_cancel and should_cancel():
+                    cancelled = True
+                    if run_logger:
+                        run_logger(
+                            run_meta.run_id,
+                            "phase=execute status=cancelled reason=cancel_requested",
+                        )
+                    break
                 if run_logger:
                     run_logger(
                         run_meta.run_id,
@@ -90,6 +100,15 @@ class TestRunner:
                     else settings.beta_base_url
                 )
                 for step in interpreted.steps:
+                    if should_cancel and should_cancel():
+                        cancelled = True
+                        case_status = "cancelled"
+                        if run_logger:
+                            run_logger(
+                                run_meta.run_id,
+                                f"phase=execute testcase={test_case_id} status=cancelled reason=cancel_requested",
+                            )
+                        break
                     step_result = await self.action_executor.execute_step(
                         page=page,
                         step_record=step,
@@ -129,7 +148,7 @@ class TestRunner:
                 )
                 if case_status == "passed":
                     passed += 1
-                else:
+                elif case_status == "failed":
                     failed += 1
                 if run_logger:
                     run_logger(
@@ -139,7 +158,7 @@ class TestRunner:
 
         return RunExecutionSummary(
             run_id=run_meta.run_id,
-            status="completed" if failed == 0 else "failed",
+            status="cancelled" if cancelled else ("completed" if failed == 0 else "failed"),
             total_cases=len(results),
             passed_cases=passed,
             failed_cases=failed,

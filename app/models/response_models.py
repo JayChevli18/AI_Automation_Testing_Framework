@@ -92,5 +92,95 @@ class InterpretedStepsPatchResponse(BaseModel):
     success: bool
     run_id: str
     patched_test_case_ids: list[str]
+    revision: int | None = None
     message: str = ""
+
+
+class RunListItem(BaseModel):
+    """Single run row for list APIs."""
+
+    run_id: str
+    file_id: str
+    status: str
+    environment: str
+    created_at: str
+    updated_at: str
+
+
+class RunListResponse(BaseModel):
+    """Legacy response for simple run listing."""
+
+    success: bool
+    runs: list[RunListItem]
+
+
+class RunListMeta(BaseModel):
+    """Pagination metadata for run listing."""
+
+    currentPage: int
+    totalPages: int
+    totalItems: int
+    itemsPerPage: int
+    hasNextPage: bool
+    hasPreviousPage: bool
+
+
+class RunListData(BaseModel):
+    """Data block for paginated run listing."""
+
+    list: list[RunListItem]
+    meta: RunListMeta
+
+
+class RunListPostResponse(BaseModel):
+    """POST response for run listing with pagination/filter/search."""
+
+    success: bool
+    message: str
+    data: RunListData
+
+
+class InterpretedStepsReadResponse(BaseModel):
+    """Read interpreted steps JSON for a run."""
+
+    success: bool
+    run_id: str
+    interpreted_steps: list[dict]
+    revision: int | None = None
+
+
+class LatestExecutionResponse(BaseModel):
+    """Latest versioned execution metadata."""
+
+    success: bool
+    run_id: str
+    execution_id: str | None
+    execution: dict | None = None
+
+
+class ArtifactIndexResponse(BaseModel):
+    """Artifact index response for UI evidence panels."""
+
+    success: bool
+    run_id: str
+    execution_id: str | None
+    artifacts: dict
+
+
+class CancelRunResponse(BaseModel):
+    """Response body for cancellation requests."""
+
+    success: bool
+    run_id: str
+    status: str
+    message: str
+
+
+class CleanupRunsResponse(BaseModel):
+    """Response for retention cleanup."""
+
+    success: bool
+    message: str
+    deleted_run_ids: list[str]
+    scanned: int
 

@@ -3,10 +3,11 @@
 from __future__ import annotations
 
 import asyncio
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from app.core.constants import (
+    RUN_STATUS_CANCELLED,
     RUN_STATUS_COMPLETED,
     RUN_STATUS_FAILED,
     RUN_STATUS_INTERPRETED,
@@ -18,9 +19,11 @@ from app.core.logger import get_logger
 from app.models.execution_models import RunExecutionSummary
 from app.models.interpreted_models import InterpretedCaseRecord, InterpretedStepRecord
 from app.models.request_models import (
+    CleanupRunsRequest,
     ExecuteFromInterpretedRequest,
     InterpretRunRequest,
     InterpretedStepsPatchRequest,
+    RunListRequest,
     RunRequest,
     StepPatchItem,
 )
@@ -33,6 +36,7 @@ from app.services.storage_service import StorageService
 from app.services.test_runner import TestRunner
 from app.services.testcase_normalizer import TestcaseNormalizer
 from app.services.report_service import ReportService
+from app.utils.listing_utils import apply_listing_query
 
 
 class RunManager:
@@ -77,6 +81,41 @@ class RunManager:
     def get_run(self, run_id: str) -> RunMeta:
         return self.storage_service.get_run_meta(run_id)
 
+    def list_runs(self, limit: int = 50) -> list[RunMeta]:
+        """Return run metadata rows for list UIs."""
+        return self.storage_service.list_run_metas(limit=limit)
+
+    @staticmethod
+    def _field_value(run: RunMeta, field: str) -> object:
+        return getattr(run, field)
+
+    def list_runs_with_query(self, query: RunListRequest) -> tuple[list[RunMeta], int]:
+        """Run listing with filter/search/sort and pagination."""
+        rows = self.storage_service.list_run_metas(limit=5000)
+        return apply_listing_query(
+            rows,
+            page=query.page,
+            limit=query.limit,
+            search=query.search,
+            search_getters=[
+                lambda r: r.run_id,
+                lambda r: r.file_id,
+                lambda r: r.status,
+                lambda r: r.environment,
+            ],
+            filters=query.filters,
+            sort_by=query.sortingOptions.sortBy,
+            sort_order=query.sortingOptions.sortOrder,
+            value_getter=self._field_value,
+            datetime_fields={"created_at", "updated_at"},
+        )
+
+    @staticmethod
+    def _apply_case_limit(items: list, max_cases: int | None) -> list:
+        if max_cases is None or max_cases <= 0:
+            return items
+        return items[:max_cases]
+
     def get_run_counts(self, run_id: str, status: str) -> RunCounts:
         """Return lightweight case counts based on normalized artifacts."""
         try:
@@ -90,6 +129,23 @@ class RunManager:
                     running_cases=int(execution_summary.get("running_cases", 0)),
                     pending_cases=int(execution_summary.get("pending_cases", 0)),
                 )
+        except Exception:
+            pass
+
+        try:
+            latest_execution_id = self.storage_service.get_latest_execution_id(run_id)
+            if latest_execution_id:
+                rel = Path("executions") / latest_execution_id / "execution_summary.json"
+                execution_summary = self.storage_service.read_json_relative(run_id, rel)
+                if isinstance(execution_summary, dict):
+                    return RunCounts(
+                        total_cases=int(execution_summary.get("total_cases", 0)),
+                        passed_cases=int(execution_summary.get("passed_cases", 0)),
+                        failed_cases=int(execution_summary.get("failed_cases", 0)),
+                        skipped_cases=int(execution_summary.get("skipped_cases", 0)),
+                        running_cases=int(execution_summary.get("running_cases", 0)),
+                        pending_cases=int(execution_summary.get("pending_cases", 0)),
+                    )
         except Exception:
             pass
 
@@ -115,6 +171,8 @@ class RunManager:
         input_path = self.storage_service.get_run_input_file(run_id)
         raw_rows = self.excel_parser.parse_excel(input_path)
         normalized_cases = self.testcase_normalizer.normalize(raw_rows)
+        run_meta = self.get_run(run_id)
+        normalized_cases = self._apply_case_limit(normalized_cases, run_meta.max_cases)
 
         self.storage_service.write_json(
             run_id=run_id,
@@ -133,6 +191,8 @@ class RunManager:
         raw = self.storage_service.read_json(run_id, "normalized_testcases.json")
         if not isinstance(raw, list):
             raise ValueError("normalized_testcases.json must be a list")
+        run_meta = self.get_run(run_id)
+        raw = self._apply_case_limit(raw, run_meta.max_cases)
 
         cases_out: list[InterpretedCaseRecord] = []
         success_count = 0
@@ -179,6 +239,7 @@ class RunManager:
             name="interpreted_steps.json",
             payload=[c.model_dump(mode="json") for c in cases_out],
         )
+        self.storage_service.set_interpreted_revision(run_id, 1)
         self._log(
             run_id,
             f"phase=interpret status=done interpreted_steps={success_count} failed_steps={failed_count}",
@@ -209,6 +270,8 @@ class RunManager:
 
         normalized_cases = [NormalizedTestCase.model_validate(i) for i in normalized_raw]
         interpreted_cases = [InterpretedCaseRecord.model_validate(i) for i in interpreted_raw]
+        normalized_cases = self._apply_case_limit(normalized_cases, run_meta.max_cases)
+        interpreted_cases = self._apply_case_limit(interpreted_cases, run_meta.max_cases)
         run_dir = self.storage_service.get_run_dir(run_id)
 
         summary = asyncio.run(
@@ -218,6 +281,7 @@ class RunManager:
                 interpreted_cases=interpreted_cases,
                 run_dir=run_dir,
                 run_logger=self._log,
+                should_cancel=lambda: self.storage_service.is_cancel_requested(run_id),
             )
         )
         self.storage_service.write_json(
@@ -231,33 +295,90 @@ class RunManager:
             run_id,
             f"phase=report status=done allure_results_dir={allure_dir} html_report={html_report}",
         )
-        self.storage_service.update_run_status(
-            run_id, RUN_STATUS_COMPLETED if summary.failed_cases == 0 else RUN_STATUS_FAILED
-        )
+        if summary.status == "cancelled":
+            final_status = RUN_STATUS_CANCELLED
+        else:
+            final_status = RUN_STATUS_COMPLETED if summary.failed_cases == 0 else RUN_STATUS_FAILED
+        self.storage_service.update_run_status(run_id, final_status)
         self._log(
             run_id,
             f"phase=execute status=done total_cases={summary.total_cases} passed={summary.passed_cases} failed={summary.failed_cases}",
         )
         return summary
 
-    def get_execution_summary(self, run_id: str) -> dict:
+    def get_execution_summary(self, run_id: str, execution_id: str | None = None) -> dict:
         """Return persisted full execution summary JSON."""
-        raw = self.storage_service.read_json(run_id, "execution_summary.json")
-        if not isinstance(raw, dict):
-            raise ValueError("execution_summary.json must be an object")
-        return raw
+        if execution_id:
+            return self.get_versioned_execution_summary(run_id, execution_id)
+        try:
+            raw = self.storage_service.read_json(run_id, "execution_summary.json")
+            if not isinstance(raw, dict):
+                raise ValueError("execution_summary.json must be an object")
+            return raw
+        except Exception:
+            latest_execution_id = self.storage_service.get_latest_execution_id(run_id)
+            if not latest_execution_id:
+                raise
+            rel = Path("executions") / latest_execution_id / "execution_summary.json"
+            raw = self.storage_service.read_json_relative(run_id, rel)
+            if not isinstance(raw, dict):
+                raise ValueError("execution_summary.json must be an object")
+            return raw
 
-    def get_report_index(self, run_id: str) -> dict:
+    def get_report_index(self, run_id: str, execution_id: str | None = None) -> dict:
         """Return report artifact locations for a run."""
+        if execution_id:
+            return self.get_versioned_report_index(run_id, execution_id)
         run_dir = self.storage_service.get_run_dir(run_id)
         allure_dir = run_dir / "allure-results"
-        if not allure_dir.exists():
+        if allure_dir.exists():
+            result_files = sorted(p.name for p in allure_dir.glob("*-result.json"))
+            return {
+                "allure_results_dir": str(allure_dir),
+                "allure_result_files": result_files,
+                "html_report_path": str(run_dir / "report.html"),
+            }
+        latest_execution_id = self.storage_service.get_latest_execution_id(run_id)
+        if not latest_execution_id:
             raise FileNotFoundError("allure-results not found for this run")
-        result_files = sorted(p.name for p in allure_dir.glob("*-result.json"))
+        return self.get_versioned_report_index(run_id, latest_execution_id)
+
+    def get_interpreted_steps(self, run_id: str) -> tuple[list[dict], int]:
+        """Return interpreted_steps.json payload."""
+        raw = self.storage_service.read_json(run_id, "interpreted_steps.json")
+        if not isinstance(raw, list):
+            raise ValueError("interpreted_steps.json must be a JSON array")
+        return raw, self.storage_service.get_interpreted_revision(run_id)
+
+    def get_latest_execution_info(self, run_id: str) -> tuple[str | None, dict | None]:
+        """Return latest execution id and manifest entry."""
+        entry = self.storage_service.get_latest_execution_entry(run_id)
+        if not entry:
+            return None, None
+        execution_id = entry.get("execution_id")
+        return (str(execution_id) if execution_id else None, entry)
+
+    def get_artifact_index(self, run_id: str, execution_id: str | None = None) -> dict:
+        """Return a consolidated artifact index for UI evidence rendering."""
+        run_dir = self.storage_service.get_run_dir(run_id)
+        target_execution_id = execution_id
+        base_dir = run_dir
+        if target_execution_id is None:
+            target_execution_id = self.storage_service.get_latest_execution_id(run_id)
+        if target_execution_id:
+            base_dir = run_dir / "executions" / target_execution_id
+
+        report_index = self.get_report_index(run_id, target_execution_id)
+        screenshots = sorted(str(p) for p in (base_dir / "screenshots").glob("*.png"))
+        html_dumps = sorted(str(p) for p in (base_dir / "html").glob("*.html"))
+        summary_path = base_dir / "execution_summary.json"
+
         return {
-            "allure_results_dir": str(allure_dir),
-            "allure_result_files": result_files,
-            "html_report_path": str(run_dir / "report.html"),
+            "execution_id": target_execution_id,
+            "report": report_index,
+            "summary_path": str(summary_path) if summary_path.exists() else None,
+            "screenshots": screenshots,
+            "html_dumps": html_dumps,
         }
 
     def interpret_only(self, request: InterpretRunRequest) -> RunMeta:
@@ -307,6 +428,8 @@ class RunManager:
 
         normalized_cases = [NormalizedTestCase.model_validate(i) for i in normalized_raw]
         interpreted_cases = [InterpretedCaseRecord.model_validate(i) for i in interpreted_raw]
+        normalized_cases = self._apply_case_limit(normalized_cases, run_meta.max_cases)
+        interpreted_cases = self._apply_case_limit(interpreted_cases, run_meta.max_cases)
 
         try:
             summary = asyncio.run(
@@ -316,6 +439,7 @@ class RunManager:
                     interpreted_cases=interpreted_cases,
                     run_dir=run_dir,
                     run_logger=self._log,
+                    should_cancel=lambda: self.storage_service.is_cancel_requested(run_id),
                     artifact_base_dir=execution_dir,
                 )
             )
@@ -362,7 +486,10 @@ class RunManager:
         )
         self.storage_service.write_latest_execution_pointer(run_id, execution_id)
 
-        final_status = RUN_STATUS_COMPLETED if summary.failed_cases == 0 else RUN_STATUS_FAILED
+        if summary.status == "cancelled":
+            final_status = RUN_STATUS_CANCELLED
+        else:
+            final_status = RUN_STATUS_COMPLETED if summary.failed_cases == 0 else RUN_STATUS_FAILED
         self.storage_service.update_run_status(run_id, final_status)
         self._log(
             run_id,
@@ -410,12 +537,19 @@ class RunManager:
             data["interpretation_error"] = patch.interpretation_error
         return InterpretedStepRecord.model_validate(data)
 
-    def patch_interpreted_steps(self, run_id: str, request: InterpretedStepsPatchRequest) -> list[str]:
+    def patch_interpreted_steps(
+        self, run_id: str, request: InterpretedStepsPatchRequest
+    ) -> tuple[list[str], int]:
         """Merge PATCH payload into interpreted_steps.json (validated, atomic write)."""
         meta = self.get_run(run_id)
         if meta.status == RUN_STATUS_RUNNING:
             raise ConflictError(
                 "Run status is 'running'; wait until execution finishes before editing interpreted steps."
+            )
+        current_revision = self.storage_service.get_interpreted_revision(run_id)
+        if request.expected_revision is not None and request.expected_revision != current_revision:
+            raise ConflictError(
+                f"Revision mismatch. expected={request.expected_revision}, current={current_revision}"
             )
 
         raw = self.storage_service.read_json(run_id, "interpreted_steps.json")
@@ -457,6 +591,43 @@ class RunManager:
 
         self.storage_service.backup_interpreted_steps_if_exists(run_id)
         self.storage_service.atomic_write_interpreted_steps(run_id, payload)
-        self._log(run_id, f"interpreted_steps.json patched test_cases={patched_ids}")
-        return patched_ids
+        next_revision = max(1, current_revision) + 1
+        self.storage_service.set_interpreted_revision(run_id, next_revision)
+        self._log(
+            run_id,
+            f"interpreted_steps.json patched test_cases={patched_ids} revision={next_revision}",
+        )
+        return patched_ids, next_revision
+
+    def request_cancel(self, run_id: str, reason: str | None = None) -> RunMeta:
+        """Request cancellation for a run."""
+        meta = self.get_run(run_id)
+        if meta.status not in {RUN_STATUS_RUNNING, RUN_STATUS_QUEUED, RUN_STATUS_INTERPRETED}:
+            return meta
+        updated = self.storage_service.request_cancel_run(run_id)
+        self._log(
+            run_id,
+            f"phase=cancel status=requested reason={reason or 'user_requested'}",
+        )
+        return updated
+
+    def cleanup_runs(self, request: CleanupRunsRequest) -> tuple[list[str], int]:
+        """Delete old non-running runs based on retention policy."""
+        all_runs = self.storage_service.list_run_metas(limit=10000)
+        cutoff = datetime.now(timezone.utc) - timedelta(days=request.retain_days)
+        candidates = [
+            r
+            for r in all_runs
+            if r.updated_at < cutoff
+            and r.status not in {RUN_STATUS_RUNNING, RUN_STATUS_QUEUED}
+        ]
+        candidates = candidates[: request.max_delete]
+        deleted_ids: list[str] = []
+        if not request.dry_run:
+            for run in candidates:
+                self.storage_service.delete_run_dir(run.run_id)
+                deleted_ids.append(run.run_id)
+        else:
+            deleted_ids = [r.run_id for r in candidates]
+        return deleted_ids, len(all_runs)
 
