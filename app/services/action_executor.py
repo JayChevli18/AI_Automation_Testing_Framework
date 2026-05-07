@@ -148,9 +148,7 @@ class ActionExecutor:
                 )
                 if assertion_text:
                     attempts_used = await self._retry_assert(
-                        lambda: expect(
-                            page.get_by_text(assertion_text, exact=False).first
-                        ).to_be_visible(timeout=timeout),
+                        lambda: self._assert_any_visible_text(page, assertion_text, timeout),
                     )
                     locator_strategy = "text_assert"
                 else:
@@ -166,9 +164,7 @@ class ActionExecutor:
             elif action == "assert_text":
                 text = interpreted.assertion.get("text") if interpreted.assertion else target
                 attempts_used = await self._retry_assert(
-                    lambda: expect(page.get_by_text(text, exact=False).first).to_be_visible(
-                        timeout=timeout
-                    ),
+                    lambda: self._assert_any_visible_text(page, text, timeout),
                 )
                 locator_strategy = "text_assert"
             elif action == "wait":
@@ -244,6 +240,26 @@ class ActionExecutor:
                     await asyncio.sleep(settings.step_retry_delay_ms / 1000)
         assert last is not None
         raise last
+
+    @staticmethod
+    async def _assert_any_visible_text(page: Page, text: str, timeout: int) -> None:
+        """Pass when any element containing text is visible.
+
+        get_by_text(...).first can resolve to hidden nodes (e.g., hidden <option>).
+        We scan all matches and succeed if at least one is visible.
+        """
+        needle = (text or "").strip()
+        if not needle:
+            raise AssertionError("Expected assertion text is empty.")
+
+        locator = page.get_by_text(needle, exact=False)
+        await expect(locator.first).to_be_attached(timeout=timeout)
+
+        count = await locator.count()
+        for i in range(count):
+            if await locator.nth(i).is_visible():
+                return
+        raise AssertionError(f"Text '{needle}' was found but no visible match was detected.")
 
     async def _retry_interaction(
         self,
