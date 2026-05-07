@@ -155,6 +155,24 @@ class LocatorEngine:
                 sel = "input[type='password'], input[name*='password'], input[id*='password']"
                 recipe = {"t": "locator", "selector": sel, "strategy": "input_password"}
                 return page.locator(sel), "input_password", recipe
+            # Many inputs (like search bars) don't have a visible/accessible <label>.
+            # In those cases, "target" is often a human phrase like "search field".
+            # We try a keyword-based fallback against input[name/id/placeholder].
+            tokens = [t for t in re.split(r"[^a-z0-9]+", lower) if t]
+            drop = {"field", "input", "textbox", "text", "box"}
+            keyword = next((t for t in tokens if t and t not in drop), "")
+            if keyword:
+                sel = (
+                    f"input[name*='{keyword}'], input[id*='{keyword}'], input[placeholder*='{keyword}']"
+                )
+                recipe = {
+                    "t": "locator",
+                    "selector": sel,
+                    "strategy": f"input_keyword_{keyword}",
+                }
+                return page.locator(sel), "input_keyword", recipe
+
+            # Final fallback: try label-based lookup.
             recipe = {"t": "label", "label": normalized}
             return page.get_by_label(normalized), "label", recipe
 
