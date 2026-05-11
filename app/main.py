@@ -5,6 +5,7 @@ from __future__ import annotations
 from uuid import uuid4
 
 from fastapi import FastAPI, HTTPException, Request
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
 from app.api.routes.test_routes import router as tests_router
@@ -14,6 +15,16 @@ from app.services.storage_service import StorageService
 
 app = FastAPI(title=settings.app_name, version=settings.app_version)
 app.include_router(tests_router, prefix=settings.api_prefix)
+
+_cors_origins = [o.strip() for o in settings.cors_allow_origins.split(",") if o.strip()]
+if _cors_origins:
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=_cors_origins,
+        allow_credentials=True,
+        allow_methods=["*"],
+        allow_headers=["*"],
+    )
 
 
 @app.middleware("http")

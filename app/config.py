@@ -37,6 +37,10 @@ class Settings:
     )
     step_retry_max: int = int(os.getenv("STEP_RETRY_MAX", "2"))
     step_retry_delay_ms: int = int(os.getenv("STEP_RETRY_DELAY_MS", "400"))
+    cors_allow_origins: str = os.getenv(
+        "CORS_ALLOW_ORIGINS",
+        "http://localhost:3000,http://127.0.0.1:3000",
+    )
 
     @property
     def uploads_dir(self) -> Path:
