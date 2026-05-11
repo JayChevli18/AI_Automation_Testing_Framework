@@ -53,6 +53,8 @@ apiClient.interceptors.response.use(
 );
 
 export function getApiError(error: unknown): ParsedApiError | null {
+  const direct = (error as { apiError?: ParsedApiError } | null)?.apiError;
+  if (direct) return direct;
   if (!axios.isAxiosError(error)) return null;
   const extended = error as AxiosError & { apiError?: ParsedApiError };
   if (extended.apiError) return extended.apiError;
