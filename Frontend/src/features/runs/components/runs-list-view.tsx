@@ -29,7 +29,7 @@ import { listRuns } from "../api/list-runs";
 import { useDebounced } from "../hooks/use-debounced";
 import { formatDateTime } from "../lib/format";
 import { runsKeys } from "../query-keys";
-import type { RunListRequestBody, RunListSortBy, RunListSortOrder } from "../types";
+import type { RunListFilter, RunListRequestBody, RunListSortBy, RunListSortOrder } from "../types";
 
 import { StatusBadge } from "./status-badge";
 
@@ -44,6 +44,18 @@ const SORT_FIELDS: { value: RunListSortBy; label: string }[] = [
   { value: "environment", label: "Environment" },
 ];
 
+const selectCls =
+  "border-input bg-background ring-offset-background focus-visible:ring-ring flex h-8 rounded-md border px-2 text-sm focus-visible:ring-2 focus-visible:ring-offset-2 focus-visible:outline-none";
+
+type AdvRow = {
+  id: string;
+  field: RunListSortBy;
+  operator: RunListFilter["operator"];
+  value: string;
+};
+
+const FILTER_OPS: RunListFilter["operator"][] = ["equals", "contains", "gte", "lte"];
+
 export function RunsListView() {
   const [page, setPage] = useState(1);
   const [limit, setLimit] = useState(25);
@@ -52,12 +64,20 @@ export function RunsListView() {
   const [sortBy, setSortBy] = useState<RunListSortBy>("created_at");
   const [sortOrder, setSortOrder] = useState<RunListSortOrder>("desc");
   const [status, setStatus] = useState<string>("");
+  const [advancedOpen, setAdvancedOpen] = useState(false);
+  const [advRows, setAdvRows] = useState<AdvRow[]>([]);
 
   const listBody: RunListRequestBody = useMemo(() => {
-    const filters =
-      status === ""
-        ? []
-        : [{ field: "status" as const, operator: "equals" as const, value: status }];
+    const statusFilters: RunListFilter[] =
+      status === "" ? [] : [{ field: "status", operator: "equals", value: status }];
+    const extraFilters: RunListFilter[] = advRows
+      .filter((r) => r.value.trim() !== "")
+      .map((r) => ({
+        field: r.field,
+        operator: r.operator,
+        value: r.value.trim(),
+      }));
+    const filters = [...statusFilters, ...extraFilters];
     return {
       page,
       limit,
@@ -65,7 +85,7 @@ export function RunsListView() {
       sortingOptions: { sortBy, sortOrder },
       filters,
     };
-  }, [page, limit, debouncedSearch, sortBy, sortOrder, status]);
+  }, [page, limit, debouncedSearch, sortBy, sortOrder, status, advRows]);
 
   const q = useQuery({
     queryKey: runsKeys.list(listBody),
@@ -112,7 +132,7 @@ export function RunsListView() {
             <Label htmlFor="run-status">Status</Label>
             <select
               id="run-status"
-              className="border-input bg-background ring-offset-background focus-visible:ring-ring flex h-8 w-44 rounded-md border px-2 text-sm focus-visible:ring-2 focus-visible:ring-offset-2 focus-visible:outline-none"
+              className={cn(selectCls, "w-44")}
               value={status}
               onChange={(e) => {
                 setStatus(e.target.value);
@@ -131,7 +151,7 @@ export function RunsListView() {
             <Label htmlFor="run-sort">Sort by</Label>
             <select
               id="run-sort"
-              className="border-input bg-background ring-offset-background focus-visible:ring-ring flex h-8 w-40 rounded-md border px-2 text-sm focus-visible:ring-2 focus-visible:ring-offset-2 focus-visible:outline-none"
+              className={cn(selectCls, "w-40")}
               value={sortBy}
               onChange={(e) => {
                 setSortBy(e.target.value as RunListSortBy);
@@ -149,7 +169,7 @@ export function RunsListView() {
             <Label htmlFor="run-order">Order</Label>
             <select
               id="run-order"
-              className="border-input bg-background ring-offset-background focus-visible:ring-ring flex h-8 w-32 rounded-md border px-2 text-sm focus-visible:ring-2 focus-visible:ring-offset-2 focus-visible:outline-none"
+              className={cn(selectCls, "w-32")}
               value={sortOrder}
               onChange={(e) => {
                 setSortOrder(e.target.value as RunListSortOrder);
@@ -164,7 +184,7 @@ export function RunsListView() {
             <Label htmlFor="run-limit">Page size</Label>
             <select
               id="run-limit"
-              className="border-input bg-background ring-offset-background focus-visible:ring-ring flex h-8 w-24 rounded-md border px-2 text-sm focus-visible:ring-2 focus-visible:ring-offset-2 focus-visible:outline-none"
+              className={cn(selectCls, "w-24")}
               value={String(limit)}
               onChange={(e) => {
                 setLimit(Number(e.target.value));
@@ -179,6 +199,141 @@ export function RunsListView() {
             </select>
           </div>
         </CardContent>
+      </Card>
+
+      <Card>
+        <CardHeader className="pb-3">
+          <div className="flex flex-wrap items-center justify-between gap-2">
+            <div>
+              <CardTitle className="text-base">Advanced filters</CardTitle>
+              <CardDescription>
+                Extra <code className="rounded bg-muted px-1 text-xs">filters[]</code> entries (AND with quick status
+                above). Use ISO-like strings for date <code className="rounded bg-muted px-1 text-xs">gte</code> /{" "}
+                <code className="rounded bg-muted px-1 text-xs">lte</code>.
+              </CardDescription>
+            </div>
+            <Button
+              type="button"
+              variant="outline"
+              size="sm"
+              onClick={() => setAdvancedOpen((o) => !o)}
+            >
+              {advancedOpen ? "Hide" : "Show"}
+            </Button>
+          </div>
+        </CardHeader>
+        {advancedOpen && (
+          <CardContent className="space-y-3">
+            {advRows.map((row) => (
+              <div
+                key={row.id}
+                className="flex flex-wrap items-end gap-2 border-b border-border/60 pb-3 last:border-0 last:pb-0"
+              >
+                <div className="grid gap-1">
+                  <Label className="text-xs">Field</Label>
+                  <select
+                    className={cn(selectCls, "min-w-[140px]")}
+                    value={row.field}
+                    onChange={(e) => {
+                      const field = e.target.value as RunListSortBy;
+                      setAdvRows((rows) =>
+                        rows.map((r) => (r.id === row.id ? { ...r, field } : r)),
+                      );
+                      setPage(1);
+                    }}
+                  >
+                    {SORT_FIELDS.map((f) => (
+                      <option key={f.value} value={f.value}>
+                        {f.label}
+                      </option>
+                    ))}
+                  </select>
+                </div>
+                <div className="grid gap-1">
+                  <Label className="text-xs">Operator</Label>
+                  <select
+                    className={cn(selectCls, "w-32")}
+                    value={row.operator}
+                    onChange={(e) => {
+                      const operator = e.target.value as RunListFilter["operator"];
+                      setAdvRows((rows) =>
+                        rows.map((r) => (r.id === row.id ? { ...r, operator } : r)),
+                      );
+                      setPage(1);
+                    }}
+                  >
+                    {FILTER_OPS.map((op) => (
+                      <option key={op} value={op}>
+                        {op}
+                      </option>
+                    ))}
+                  </select>
+                </div>
+                <div className="grid min-w-[160px] flex-1 gap-1">
+                  <Label className="text-xs">Value</Label>
+                  <Input
+                    value={row.value}
+                    onChange={(e) => {
+                      const value = e.target.value;
+                      setAdvRows((rows) =>
+                        rows.map((r) => (r.id === row.id ? { ...r, value } : r)),
+                      );
+                      setPage(1);
+                    }}
+                    placeholder="e.g. beta, run_…, 2026-05-01T00:00:00"
+                  />
+                </div>
+                <Button
+                  type="button"
+                  variant="ghost"
+                  size="sm"
+                  className="text-destructive"
+                  onClick={() => {
+                    setAdvRows((rows) => rows.filter((r) => r.id !== row.id));
+                    setPage(1);
+                  }}
+                >
+                  Remove
+                </Button>
+              </div>
+            ))}
+            <div className="flex flex-wrap gap-2">
+              <Button
+                type="button"
+                variant="secondary"
+                size="sm"
+                disabled={advRows.length >= 10}
+                onClick={() => {
+                  setAdvRows((rows) => [
+                    ...rows,
+                    {
+                      id: crypto.randomUUID(),
+                      field: "run_id",
+                      operator: "contains",
+                      value: "",
+                    },
+                  ]);
+                  setPage(1);
+                }}
+              >
+                Add filter row
+              </Button>
+              {advRows.length > 0 && (
+                <Button
+                  type="button"
+                  variant="outline"
+                  size="sm"
+                  onClick={() => {
+                    setAdvRows([]);
+                    setPage(1);
+                  }}
+                >
+                  Clear all
+                </Button>
+              )}
+            </div>
+          </CardContent>
+        )}
       </Card>
 
       {q.isError && (

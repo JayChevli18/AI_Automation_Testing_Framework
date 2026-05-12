@@ -52,9 +52,20 @@ export function ExecutionsListView({ runId }: { runId: string }) {
           <h1 className="text-2xl font-semibold tracking-tight">Executions</h1>
           <p className="text-muted-foreground font-mono text-sm">{runId}</p>
         </div>
-        <Link href={`/runs/${encodeURIComponent(runId)}`} className={cn(buttonVariants({ variant: "outline", size: "sm" }))}>
-          Run detail
-        </Link>
+        <div className="flex flex-wrap gap-2">
+          <Link
+            href={`/runs/${encodeURIComponent(runId)}`}
+            className={cn(buttonVariants({ variant: "outline", size: "sm" }))}
+          >
+            Run detail
+          </Link>
+          <Link
+            href={`/runs/${encodeURIComponent(runId)}/artifacts`}
+            className={cn(buttonVariants({ variant: "outline", size: "sm" }))}
+          >
+            Artifacts
+          </Link>
+        </div>
       </div>
 
       {q.isError && (
