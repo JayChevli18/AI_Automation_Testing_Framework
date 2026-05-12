@@ -18,6 +18,8 @@ import { Label } from "@/components/ui/label";
 import { Separator } from "@/components/ui/separator";
 import { Skeleton } from "@/components/ui/skeleton";
 import { dashboardKeys } from "@/features/dashboard/query-keys";
+import { executionsKeys } from "@/features/executions/query-keys";
+import { interpretedKeys } from "@/features/interpreted/query-keys";
 import { cn } from "@/lib/utils";
 import { getApiError } from "@/shared/api/client";
 
@@ -90,6 +92,8 @@ export function RunDetailView({ runId }: { runId: string }) {
       await queryClient.invalidateQueries({ queryKey: runsKeys.row(runId) });
       await queryClient.invalidateQueries({ queryKey: runsKeys.root });
       await queryClient.invalidateQueries({ queryKey: dashboardKeys.root });
+      await queryClient.invalidateQueries({ queryKey: executionsKeys.list(runId) });
+      await queryClient.invalidateQueries({ queryKey: interpretedKeys.read(runId) });
     },
     onError: (e) => {
       setActionError(getApiError(e)?.message ?? (e as Error).message);
