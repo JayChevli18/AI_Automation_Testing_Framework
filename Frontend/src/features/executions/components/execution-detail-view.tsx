@@ -89,6 +89,12 @@ export function ExecutionDetailView({
           >
             Run detail
           </Link>
+          <Link
+            href={`/runs/${encodeURIComponent(runId)}/artifacts`}
+            className={cn(buttonVariants({ variant: "outline", size: "sm" }))}
+          >
+            Artifact explorer
+          </Link>
         </div>
       </div>
 

@@ -218,6 +218,12 @@ export function InterpretedEditorView({ runId }: { runId: string }) {
           >
             Executions
           </Link>
+          <Link
+            href={`/runs/${encodeURIComponent(runId)}/artifacts`}
+            className={cn(buttonVariants({ variant: "outline", size: "sm" }))}
+          >
+            Artifacts
+          </Link>
         </div>
       </div>
 

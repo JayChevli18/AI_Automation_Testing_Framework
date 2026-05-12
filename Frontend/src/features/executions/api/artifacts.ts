@@ -8,10 +8,17 @@ export type ArtifactIndexResponse = {
   artifacts: Record<string, unknown>;
 };
 
-export async function fetchArtifacts(runId: string, executionId: string): Promise<Record<string, unknown>> {
+export async function fetchArtifacts(
+  runId: string,
+  executionId?: string | null,
+): Promise<Record<string, unknown>> {
+  const params =
+    executionId !== undefined && executionId !== null && executionId !== ""
+      ? { execution_id: executionId }
+      : undefined;
   const { data } = await apiClient.get<ArtifactIndexResponse>(
     `${API_TESTS}/runs/${encodeURIComponent(runId)}/artifacts`,
-    { params: { execution_id: executionId } },
+    params ? { params } : {},
   );
   if (!data.success) {
     throw new Error("Failed to load artifacts");
