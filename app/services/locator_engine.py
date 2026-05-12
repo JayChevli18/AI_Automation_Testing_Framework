@@ -11,6 +11,53 @@ from app.services.selector_cache import SelectorCache
 
 _ADD_TO_CART_TEXT = re.compile(r"add\s*to\s*cart", re.IGNORECASE)
 
+# Words stripped from fill targets before building id/name hints (not UI identifiers).
+_FILL_NOISE: frozenset[str] = frozenset(
+    {
+        "field",
+        "input",
+        "textbox",
+        "text",
+        "box",
+        "form",
+        "control",
+        "area",
+        "the",
+        "a",
+        "an",
+        "in",
+        "into",
+        "on",
+        "at",
+        "to",
+        "and",
+        "or",
+        "for",
+        "with",
+        "enter",
+        "type",
+        "valid",
+        "click",
+        "select",
+        "choose",
+        "put",
+        "set",
+    }
+)
+
+
+def _fill_meaningful_tokens(lower: str) -> list[str]:
+    """Tokenize target; drop prose; split hyphenated ids (search-users → search, users)."""
+    parts: list[str] = []
+    for t in re.split(r"[^a-z0-9]+", lower):
+        if not t:
+            continue
+        if "-" in t:
+            parts.extend(p for p in t.split("-") if p)
+        else:
+            parts.append(t)
+    return [p for p in parts if p not in _FILL_NOISE]
+
 _ORDINAL_PREFIX_TO_INDEX: dict[str, int] = {
     "first": 0,
     "1st": 0,
@@ -107,6 +154,43 @@ class LocatorEngine:
 
         recipe: dict[str, Any] | None = None
 
+        if action == "scroll":
+            lower = normalized.lower()
+            if not lower or lower in ("down", "downward", "page down"):
+                recipe = {"t": "locator", "selector": "body", "strategy": "scroll_viewport_down"}
+                return page.locator("body"), "scroll_viewport_down", recipe
+            if any(
+                k in lower
+                for k in (
+                    "footer",
+                    "bottom of the page",
+                    "bottom of page",
+                    "page bottom",
+                    "end of the page",
+                    "end of page",
+                )
+            ):
+                sel = "footer, [role='contentinfo']"
+                recipe = {"t": "locator", "selector": sel, "strategy": "scroll_footer"}
+                return page.locator(sel), "scroll_footer", recipe
+            if any(k in lower for k in ("main content", "primary content")) or lower in (
+                "main",
+                "main area",
+            ):
+                sel = "main, #main-content, [role='main']"
+                recipe = {"t": "locator", "selector": sel, "strategy": "scroll_main"}
+                return page.locator(sel), "scroll_main", recipe
+            if any(k in lower for k in ("header", "top of the page", "page top", "top of page")) or lower in (
+                "top",
+                "header",
+            ):
+                sel = "header, [role='banner']"
+                recipe = {"t": "locator", "selector": sel, "strategy": "scroll_header"}
+                return page.locator(sel), "scroll_header", recipe
+            sel = "footer, [role='contentinfo']"
+            recipe = {"t": "locator", "selector": sel, "strategy": "scroll_footer_default"}
+            return page.locator(sel), "scroll_footer_default", recipe
+
         if action in {"hover", "click", "assert_visible", "assert_text"}:
             lower = normalized.lower()
             name = _accessible_name_from_target(normalized)
@@ -155,9 +239,32 @@ class LocatorEngine:
                 sel = "input[type='password'], input[name*='password'], input[id*='password']"
                 recipe = {"t": "locator", "selector": sel, "strategy": "input_password"}
                 return page.locator(sel), "input_password", recipe
-            # Many inputs (like search bars) don't have a visible/accessible <label>.
-            # In those cases, "target" is often a human phrase like "search field".
-            # We try a keyword-based fallback against input[name/id/placeholder].
+
+            meaningful = _fill_meaningful_tokens(lower)
+            # Multi-token → hyphenated id/name (search + users → search-users). Avoids substring
+            # 'search' matching both #search and name=search-users; executor uses .first.
+            if len(meaningful) >= 2:
+                compound = "-".join(meaningful)
+                sel = f'#{compound}, input[id="{compound}"], input[name="{compound}"]'
+                recipe = {
+                    "t": "locator",
+                    "selector": sel,
+                    "strategy": f"input_compound_{compound}",
+                }
+                return page.locator(sel), "input_compound", recipe
+
+            # Single token: prefer exact id/name so #search does not compete with search-users via *=.
+            if len(meaningful) == 1:
+                kw = meaningful[0]
+                sel = f'#{kw}, input[id="{kw}"], input[name="{kw}"]'
+                recipe = {
+                    "t": "locator",
+                    "selector": sel,
+                    "strategy": f"input_exact_{kw}",
+                }
+                return page.locator(sel), "input_exact", recipe
+
+            # Legacy: substring match when target had no usable tokens after stripping.
             tokens = [t for t in re.split(r"[^a-z0-9]+", lower) if t]
             drop = {"field", "input", "textbox", "text", "box"}
             keyword = next((t for t in tokens if t and t not in drop), "")

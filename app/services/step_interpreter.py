@@ -16,7 +16,12 @@ logger = logging.getLogger(__name__)
 _SYSTEM_RULES = """You are a test automation step interpreter. Output ONLY one JSON object. No markdown, no prose, no code fences.
 
 Required keys: action, target, value, value_key, assertion, confidence, missing_value, notes
-- action must be exactly one of: goto, hover, click, fill, assert_visible, assert_text, wait, unknown
+- action must be exactly one of: goto, hover, click, fill, assert_visible, assert_text, scroll, wait, unknown
+
+=== scroll (viewport / lazy regions — not navigation) ===
+Use "scroll" when the step says scroll / bring into view / scroll down to / scroll up to / scroll into view (NOT loading a URL — that stays "goto").
+- target: short phrase: "footer", "main", "header", "bottom of page", "top", or "down" for a generic downward nudge.
+- value: optional string of pixels for one extra nudge after scrolling (e.g. "400"); usually null so the runner uses staged scrolling for lazy-rendered content.
 
 === goto (navigation only — strict) ===
 Use "goto" ONLY when the step is clearly about loading a page by URL or path, for example:
@@ -104,7 +109,7 @@ class StepInterpreter:
         """Ask model to fix output into valid interpreter JSON."""
         repair_prompt = f"""Fix the following into a single JSON object with keys:
 action, target, value, value_key, assertion, confidence, missing_value, notes.
-Use action enum: goto, hover, click, fill, assert_visible, assert_text, wait, unknown.
+Use action enum: goto, hover, click, fill, assert_visible, assert_text, scroll, wait, unknown.
 Input to fix: {raw_text[:4000]}"""
         try:
             fix_text = self.client.generate_text(
@@ -146,6 +151,49 @@ Input to fix: {raw_text[:4000]}"""
         hover_tokens = ("hover", "mouse over", "move cursor over")
         if any(token in step for token in hover_tokens):
             interpreted.action = "hover"
+
+        if interpreted.action != "goto":
+            if any(
+                p in step
+                for p in (
+                    "scroll to footer",
+                    "scroll down to footer",
+                    "scroll to the footer",
+                    "scroll into footer",
+                    "scroll to bottom",
+                    "scroll down to bottom",
+                    "scroll to the bottom",
+                    "scroll to end of page",
+                    "scroll to the end of the page",
+                )
+            ) or ("scroll" in step and "footer" in step):
+                interpreted.action = "scroll"
+                interpreted.target = "footer"
+            elif any(
+                p in step
+                for p in (
+                    "scroll to main",
+                    "scroll main content",
+                    "scroll to primary content",
+                    "scroll into main",
+                )
+            ) or ("scroll" in step and "main content" in step):
+                interpreted.action = "scroll"
+                interpreted.target = "main"
+            elif any(
+                p in step
+                for p in (
+                    "scroll to top",
+                    "scroll to header",
+                    "scroll to the top",
+                    "scroll up to top",
+                )
+            ) or (step.strip().startswith("scroll to top") or step.strip().startswith("scroll up")):
+                interpreted.action = "scroll"
+                interpreted.target = "header"
+            elif step.strip().startswith("scroll down") and "footer" not in step and "main" not in step:
+                interpreted.action = "scroll"
+                interpreted.target = "down"
 
         if interpreted.action == "fill":
             StepInterpreter._normalize_fill_step(raw_step, interpreted, test_data)

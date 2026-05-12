@@ -13,6 +13,7 @@ InterpretedAction = Literal[
     "fill",
     "assert_visible",
     "assert_text",
+    "scroll",
     "wait",
     "unknown",
 ]
