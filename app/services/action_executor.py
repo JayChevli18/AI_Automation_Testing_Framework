@@ -172,6 +172,15 @@ class ActionExecutor:
                 await page.wait_for_timeout(wait_ms)
                 locator_strategy = "wait"
                 attempts_used = 1
+            elif action == "scroll":
+                locator_strategy, attempts_used = await self._execute_scroll(
+                    page=page,
+                    target=target,
+                    value=interpreted.value,
+                    timeout=timeout,
+                    selector_cache=selector_cache,
+                    cache_key=cache_key,
+                )
             else:
                 raise ValueError(f"Unsupported action for v1 executor: {action}")
 
@@ -227,6 +236,98 @@ class ActionExecutor:
                 screenshot_path=screenshot_path,
                 html_snapshot_path=html_path,
             )
+
+    async def _execute_scroll(
+        self,
+        page: Page,
+        target: str,
+        value: str | None,
+        timeout: int,
+        selector_cache: SelectorCache | None,
+        cache_key: str,
+    ) -> tuple[str, int]:
+        """Scroll a region into view and nudge the window for viewport / lazy-rendered content."""
+        locator, locator_strategy, recipe = await self.locator_engine.resolve(
+            page,
+            "scroll",
+            target,
+            cache=selector_cache,
+            cache_key=cache_key,
+        )
+
+        extra_wheel = 0
+        if value is not None and str(value).strip().isdigit():
+            extra_wheel = int(str(value).strip())
+
+        if locator_strategy == "scroll_viewport_down":
+            await self._nudge_window_for_lazy_content(
+                page, timeout_ms=min(timeout, 20_000), max_chunks=30
+            )
+            if extra_wheel:
+                await page.mouse.wheel(0, extra_wheel)
+            if recipe is not None and selector_cache is not None:
+                selector_cache.set(cache_key, recipe)
+            return locator_strategy, 1
+
+        if locator_strategy == "scroll_header":
+            try:
+                await locator.first.scroll_into_view_if_needed(timeout=timeout)
+            except PlaywrightError:
+                pass
+            await page.evaluate("() => window.scrollTo(0, 0)")
+            await page.wait_for_timeout(120)
+            if extra_wheel:
+                await page.mouse.wheel(0, -abs(extra_wheel))
+            if recipe is not None and selector_cache is not None:
+                selector_cache.set(cache_key, recipe)
+            return locator_strategy, 1
+
+        try:
+            await locator.first.scroll_into_view_if_needed(timeout=timeout)
+        except PlaywrightError:
+            pass
+        await page.wait_for_timeout(120)
+
+        max_chunks = 28
+        if locator_strategy in ("scroll_footer", "scroll_footer_default"):
+            max_chunks = 42
+        elif locator_strategy == "scroll_main":
+            max_chunks = 20
+
+        if locator_strategy in ("scroll_footer", "scroll_footer_default", "scroll_main"):
+            await self._nudge_window_for_lazy_content(
+                page, timeout_ms=min(timeout, 20_000), max_chunks=max_chunks
+            )
+        if extra_wheel:
+            await page.mouse.wheel(0, extra_wheel)
+        if recipe is not None and selector_cache is not None:
+            selector_cache.set(cache_key, recipe)
+        return locator_strategy, 1
+
+    @staticmethod
+    async def _nudge_window_for_lazy_content(
+        page: Page, *, timeout_ms: int = 12_000, max_chunks: int = 35
+    ) -> None:
+        """Step the window downward so IntersectionObserver / lazy regions can mount."""
+        deadline = time.perf_counter() + timeout_ms / 1000.0
+        for _ in range(max_chunks):
+            if time.perf_counter() > deadline:
+                break
+            moved = await page.evaluate(
+                """() => {
+                    const el = document.documentElement;
+                    const h = el.scrollHeight;
+                    const y = window.scrollY;
+                    const remaining = h - window.innerHeight - y;
+                    if (remaining <= 2) return false;
+                    const step = Math.min(520, Math.max(80, remaining));
+                    window.scrollBy(0, step);
+                    return true;
+                }"""
+            )
+            if not moved:
+                break
+            await page.wait_for_timeout(90)
 
     async def _retry_assert(self, op: Callable[[], Awaitable[None]]) -> int:
         last: BaseException | None = None
@@ -284,8 +385,7 @@ class ActionExecutor:
                     cache=selector_cache if attempt == 1 else None,
                     cache_key=cache_key if attempt == 1 else None,
                 )
-                if attempt > 1:
-                    await locator.first.scroll_into_view_if_needed(timeout=timeout)
+                await locator.first.scroll_into_view_if_needed(timeout=timeout)
                 await runner(locator)
                 if recipe is not None and selector_cache is not None:
                     selector_cache.set(cache_key, recipe)
