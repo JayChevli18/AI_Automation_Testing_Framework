@@ -43,7 +43,7 @@ flowchart LR
 1. **Upload** an `.xlsx` / `.xls` file. The server stores it and returns a **`file_id`**.
 2. **Start a run** with that `file_id`. The server creates a **`run_id`** and copies the Excel into `storage/runs/<run_id>/input.xlsx`.
 3. **Normalize:** Rows become structured JSON (`normalized_testcases.json`) with columns like module, steps, test data.
-4. **Interpret:** For each manual step, **Ollama** returns a small JSON action (`goto`, `click`, `fill`, etc.) (`interpreted_steps.json`).
+4. **Interpret:** For each manual step, **Ollama** returns a small JSON action (`goto`, `click`, `fill`, `scroll`, etc.) (`interpreted_steps.json`).
 5. **Execute:** **Playwright** drives Chromium against **`BETA_BASE_URL`** or **`LIVE_BASE_URL`** from `.env`, step by step.
 6. **Report:** Writes **`execution_summary.json`**, **Allure** JSON files under `allure-results/`, and **`report.html`**.
 
@@ -106,7 +106,7 @@ flowchart TB
 | **Run manager** | Single place that orders phases and writes run logs; split interpret/execute and versioned execution paths. |
 | **Excel + normalizer** | Excel → structured test cases. |
 | **Ollama client + interpreter** | Natural language step → JSON action. |
-| **Test runner + executor** | Playwright runs actions; locator engine finds elements. |
+| **Test runner + executor** | Playwright runs actions; locator engine finds elements; **`scroll`** + staged **`scrollBy`** for lazy/viewport content; **`scroll_into_view`** before **`click` / `hover` / `fill`**. |
 | **Report service** | Allure JSON + HTML report from execution summary. |
 | **Storage** | Files under `storage/uploads` and `storage/runs`. |
 
@@ -582,7 +582,8 @@ Sample files may live under `docs/` (e.g. `TestCases_Login_Module_Sample.xlsx`).
 - **Prompts:** Defined as **`_SYSTEM_RULES`**, **`_USER_TEMPLATE`**, and the **`repair_invalid_json`** repair string in `app/services/step_interpreter.py`. The exact text is duplicated for readability in **section 11.2 LLM prompts** (below).
 - **Important behaviors:**
   - Long **system prompt** so **`goto`** is not used for “click link” steps.
-  - **`_apply_action_overrides`** / **`_normalize_fill_step`:** reduce flaky mappings (e.g. infer **email** vs **password** field; clear bogus literal `value` when **`test_data`** should supply credentials).
+  - **`scroll`** action for viewport / lazy regions (footer, main, header, generic “down”) — not URL navigation; see **`action_executor._execute_scroll`**.
+  - **`_apply_action_overrides`** / **`_normalize_fill_step`:** reduce flaky mappings (e.g. infer **email** vs **password** field; clear bogus literal `value` when **`test_data`** should supply credentials); phrase-based overrides map “scroll to footer” / “scroll down” / etc. to **`scroll`** + **`target`** when not **`goto`**.
 
 ---
 
@@ -598,16 +599,20 @@ Sample files may live under `docs/` (e.g. `TestCases_Login_Module_Sample.xlsx`).
 ### `app/services/action_executor.py`
 
 - **Purpose:** Execute one interpreted step on a Playwright **`Page`**.
-- **Actions supported (typical):** `goto`, `hover`, `click`, `fill`, `assert_visible`, `assert_text`, `wait`.
+- **Actions supported (typical):** `goto`, `hover`, `click`, `fill`, `assert_visible`, `assert_text`, **`scroll`**, `wait`.
+- **`scroll`:** Resolves a region via **`LocatorEngine`** (`footer`, `main`, `header`, generic **`down`**), calls **`scroll_into_view_if_needed`**, then **`_nudge_window_for_lazy_content`** (stepped **`window.scrollBy`**) so IntersectionObserver / lazy content can mount; optional **`value`** = extra wheel pixels (string of digits).
+- **Interactions:** **`_retry_interaction`** always **`scroll_into_view_if_needed`** before **`click`**, **`hover`**, and **`fill`** (helps long pages and off-screen targets).
 - **Important:** **`_resolve_fill_value`** prefers **`test_data[value_key]`** when the key exists so the LLM cannot override real passwords with the word `"password"`.
-- **Safety:** **`environment=live`** can block mutating actions unless **`allow_live_mutations`** is true on the run.
+- **Safety:** **`environment=live`** can block mutating actions unless **`allow_live_mutations`** is true on the run (**`scroll`** is not blocked).
 - **Failures:** screenshots + HTML capture when configured.
 
 ---
 
 ### `app/services/locator_engine.py`
 
-- **Purpose:** Resolve Playwright **locators** from natural **`target`** strings (roles, labels, text, email/password input heuristics). Used by **`ActionExecutor`** (and retries).
+- **Purpose:** Resolve Playwright **locators** from natural **`target`** strings (roles, labels, text, email/password input heuristics, and **`scroll`** regions). Used by **`ActionExecutor`** (and retries).
+- **`fill`:** After email/password branches, **`_fill_meaningful_tokens`** builds **compound** ids (`search` + `users` → `#search-users`, `input[name="search-users"]`, …) or **exact** single-token ids to avoid broad **`name*='search'`** collisions (e.g. header vs user search).
+- **`scroll`:** Maps **`target`** to **`footer` / `main` / `header`**, generic **viewport down**, or defaults to footer for ambiguous phrases.
 
 ---
 
@@ -639,7 +644,7 @@ Sample files may live under `docs/` (e.g. `TestCases_Login_Module_Sample.xlsx`).
 | `response_models.py` | API responses including list pagination responses, **`VersionedExecutionResponse`**, **`VersionedExecutionsListResponse`**, **`VersionedExecutionSummaryResponse`**, **`InterpretedStepsPatchResponse`**, cancellation/cleanup responses, and artifact index response. |
 | `run_models.py` | **`RunMeta`** (includes `cancel_requested`), **`UploadedFileMeta`**. |
 | `testcase_models.py` | **`RawExcelRow`**, **`NormalizedTestCase`**. |
-| `interpreted_models.py` | **`InterpretedStep`**, records for **`interpreted_steps.json`**. |
+| `interpreted_models.py` | **`InterpretedStep`** (actions include **`scroll`**), records for **`interpreted_steps.json`**. |
 | `execution_models.py` | **`StepExecutionResult`**, **`CaseExecutionResult`**, **`RunExecutionSummary`**. |
 
 ---
@@ -828,7 +833,7 @@ Legend — **Called from:**
 | `repair_invalid_json(raw_text)` | Second LLM pass or regex extract to recover JSON. | `interpret_step` on parse failure | — |
 | `try_interpret_step` | Wraps `interpret_step`; returns `(InterpretedStep \| None, error \| None)`. | `generate_interpreted_steps` | Never aborts whole case on one bad step |
 | `_validate(data)` | `InterpretedStep.model_validate`. | After JSON parse | — |
-| `_apply_action_overrides(raw_step, interpreted, test_data)` | Forces `hover` from verbs; calls `_normalize_fill_step` for `fill`. | End of `interpret_step` | — |
+| `_apply_action_overrides(raw_step, interpreted, test_data)` | Forces `hover` from verbs; maps scroll phrases to **`scroll`** + **`target`**; calls `_normalize_fill_step` for `fill`. | End of `interpret_step` | — |
 | `_normalize_fill_step(...)` | Sets `value_key` from “email/password field” phrases; clears bogus `value` when `test_data` applies. | `_apply_action_overrides` | — |
 
 ---
@@ -850,8 +855,10 @@ Legend — **Called from:**
 | `_locator_cache_key(...)` | Stable string key for selector cache (`tc:step:action:target`). | `execute_step` | — |
 | `_live_mutation_blocked(...)` | True when `live` + not `allow_live_mutations` + mutating action. | `execute_step` first guard | Blocks accidental prod clicks |
 | `execute_step(...)` | Full step runner: interpretation errors, live guard, dispatch by `action`, retries, success screenshot, failure evidence. | `TestRunner.run` loop | Core automation |
+| `_execute_scroll(...)` | **`scroll`**: resolve region, **`scroll_into_view`**, optional staged **`scrollBy`** + wheel nudge; caches recipe. | `execute_step` when `action == "scroll"` | Long pages / lazy UI |
+| `_nudge_window_for_lazy_content(...)` | Repeated **`window.scrollBy`** toward document end (time + chunk capped). | `_execute_scroll` | Viewport-mounted components |
 | `_retry_assert(op)` | Retries assertion callable up to `STEP_RETRY_MAX`. | `assert_visible` / `assert_text` paths | — |
-| `_retry_interaction(...)` | Resolves locator via `LocatorEngine.resolve`, runs click/hover/fill, caches recipe on success, retries on failure. | click/hover/fill branches | — |
+| `_retry_interaction(...)` | Resolves locator, **`scroll_into_view_if_needed`** on every attempt, then click/hover/fill; caches recipe on success, retries on failure. | click/hover/fill branches | — |
 | `_resolve_fill_value` | **Prefers `test_data[value_key]`** over LLM `value` literal. | `fill` branch | Correct password from Excel |
 | `_safe_wait_ms` | Parses wait milliseconds for `wait` action. | `wait` branch | — |
 | `_resolve_url` | Builds URL from `target` + `base_url` (`website` → `/`, else append path). | `goto` | Don’t use vague targets in Excel |
@@ -864,9 +871,10 @@ Legend — **Called from:**
 
 | Name | Purpose | Called from | Example |
 |------|---------|-------------|---------|
+| `_fill_meaningful_tokens(lower)` | Tokenizes fill **`target`**, drops prose (**`_FILL_NOISE`**), splits hyphenated ids for compound **`#id`** resolution. | `resolve` when `action == "fill"` | `search users` → `search`, `users` |
 | `_accessible_name_from_target(raw)` | Strips phrases like “in the header” so Playwright role names match visible text. | `LocatorEngine.resolve` | `"Sign In link in header"` → name for link |
 | `LocatorEngine.build_from_recipe(page, recipe)` | Reconstructs `Locator` from cached dict (`t`: role/text/label/locator). | `resolve` when cache hit | — |
-| `LocatorEngine.resolve(page, action, target, cache=..., cache_key=...)` | Returns `(Locator, strategy_string, recipe_dict)`; sign-in link heuristic, button/link/text, fill email/password selectors. | `_retry_interaction` | — |
+| `LocatorEngine.resolve(page, action, target, cache=..., cache_key=...)` | Returns `(Locator, strategy_string, recipe_dict)`; **`scroll`** regions; sign-in / add-to-cart heuristics; button/link/text; **`fill`** compound or exact input selectors. | `_retry_interaction`, `_execute_scroll` | — |
 
 ---
 
@@ -928,7 +936,7 @@ These files define **Pydantic models** (fields + validation). They have **no bus
 - **`response_models.*`** — API response shapes.
 - **`run_models`** — `UploadedFileMeta`, `RunMeta` (+ `allow_live_mutations`).
 - **`testcase_models`** — `RawExcelRow`, `NormalizedTestCase`.
-- **`interpreted_models`** — `InterpretedStep`, `InterpretedStepRecord`, `InterpretedCaseRecord`.
+- **`interpreted_models`** — **`InterpretedStep`** (actions include **`scroll`**), **`InterpretedStepRecord`**, **`InterpretedCaseRecord`**.
 - **`execution_models`** — `StepExecutionResult`, `CaseExecutionResult`, `RunExecutionSummary`.
 
 **When used:** FastAPI serializes/deserializes; `RunManager` writes `model_dump(mode="json")` to disk.
@@ -968,7 +976,12 @@ Return JSON object only.
 You are a test automation step interpreter. Output ONLY one JSON object. No markdown, no prose, no code fences.
 
 Required keys: action, target, value, value_key, assertion, confidence, missing_value, notes
-- action must be exactly one of: goto, hover, click, fill, assert_visible, assert_text, wait, unknown
+- action must be exactly one of: goto, hover, click, fill, assert_visible, assert_text, scroll, wait, unknown
+
+=== scroll (viewport / lazy regions — not navigation) ===
+Use "scroll" when the step says scroll / bring into view / scroll down to / scroll up to / scroll into view (NOT loading a URL — that stays "goto").
+- target: short phrase: "footer", "main", "header", "bottom of page", "top", or "down" for a generic downward nudge.
+- value: optional string of pixels for one extra nudge after scrolling (e.g. "400"); usually null so the runner uses staged scrolling for lazy-rendered content.
 
 === goto (navigation only — strict) ===
 Use "goto" ONLY when the step is clearly about loading a page by URL or path, for example:
@@ -1026,7 +1039,7 @@ When the first response is not parseable, the code asks the model again with a *
 ```
 Fix the following into a single JSON object with keys:
 action, target, value, value_key, assertion, confidence, missing_value, notes.
-Use action enum: goto, hover, click, fill, assert_visible, assert_text, wait, unknown.
+Use action enum: goto, hover, click, fill, assert_visible, assert_text, scroll, wait, unknown.
 Input to fix: <first 4000 characters of raw model output>
 ```
 
@@ -1047,7 +1060,7 @@ sequenceDiagram
   loop Each interpreted step
     AE->>LE: resolve(target)
     LE-->>AE: Locator
-    AE->>BR: click / fill / goto / assert...
+    AE->>BR: click / fill / goto / scroll / assert...
     BR-->>AE: success or error
   end
   TR->>BR: close
@@ -1097,6 +1110,7 @@ Open **`http://127.0.0.1:8000/docs`** to try uploads and runs.
 
 ## 14. Operational notes
 
+- **Long pages and lazy UI:** Add explicit steps such as **“Scroll to footer”** or **“Scroll down to bottom”** so interpretation yields **`action: "scroll"`** before clicking footer links. **`scroll`** runs staged **`scrollBy`** to help viewport-based rendering; it does **not** open mobile accordions—you still need a **click** to expand collapsed sections if links are hidden.
 - **Long `/run` requests:** The run endpoint waits until the whole pipeline finishes. For huge suites, watch **`storage/runs/<run_id>/logs/run.log`** or call **`/results/{run_id}`** from another client while one request is in flight (same server).
 - **Interpret + execute-versioned:** Use **`/interpret`** once per uploaded workbook snapshot, then **`/execute-versioned`** many times. Each execute creates a **new** folder under **`executions/`**; inspect **`manifest.json`** or **`latest.json`** for the newest **`execution_id`**.
 - **Editing interpreted JSON:** Do not **`PATCH`** while **`execute-versioned`** (or **`/run`**) is in progress for that **`run_id`** — the API returns **409**. You can optionally send `expected_revision` for optimistic lock; mismatches also return **409**.
@@ -1121,10 +1135,11 @@ Open **`http://127.0.0.1:8000/docs`** to try uploads and runs.
 |------|---------|
 | **Run** | One workspace folder **`storage/runs/<run_id>/`** tied to one copied Excel snapshot (from **`file_id`**). |
 | **Normalize** | Convert Excel rows into clean JSON test cases. |
-| **Interpret** | Convert each manual step string into a structured action via **Ollama** → **`interpreted_steps.json`**. |
+| **Interpret** | Convert each manual step string into a structured action via **Ollama** → **`interpreted_steps.json`** (actions include e.g. **`goto`**, **`click`**, **`fill`**, **`scroll`**, **`wait`**). |
 | **Execute** | Drive the browser using **Playwright** (full **`/run`** at run root, or **`execute-versioned`** under **`executions/<execution_id>/`**). |
 | **execution_id** | Folder name **`exec_<timestamp>_<suffix>`** for one versioned browser run. |
 | **Revision lock** | Optional `expected_revision` in PATCH to prevent lost updates on interpreted steps. |
+| **Scroll (step)** | Interpreted **`action: "scroll"`** — scrolls **`footer` / `main` / `header`** (or generic **down**) into view and nudges the window for lazy-mounted content; not a URL **`goto`**. |
 | **Headless** | Browser runs without a visible window; **`headless: false`** shows the window. |
 
 ---
